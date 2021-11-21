@@ -1,0 +1,5 @@
+setup.py
+KalmanFilter.egg-info/PKG-INFO
+KalmanFilter.egg-info/SOURCES.txt
+KalmanFilter.egg-info/dependency_links.txt
+KalmanFilter.egg-info/top_level.txt
