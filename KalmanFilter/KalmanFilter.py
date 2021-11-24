@@ -241,32 +241,60 @@ class KalmanFilter:
             ll = self.log_likelihood(y)
             print('[{}] ll: {:.2f}'.format(n, ll))
 
-    def minimize(self, y, optimize):
+    def minimize(self, y, optimize, method='BFGS'):
         p = self.named_params()
         args = []
-
-        for name in optimize:
-            if name in self.constraints:
-                f, D = self.constraints[name]
-                param = np.linalg.pinv(D) @ (p[name].flatten() - f)
-                args.append(param)
-            else:
-                args.append(p[name].flatten())
-
+        # The order is important here, because this is the order in which
+        # they will be unpacked
+        names = ['Phi', 'A', 'Q', 'R', 'x0', 'E0']
         constants = {}
-        for name in p:
-            if name not in optimize:
+
+        for name in names:
+            if name in optimize:
+                if name in self.constraints:
+                    f, D = self.constraints[name]
+                    if D.shape[1] == 0:
+                        print('Warning: cannot optimize {} because its been constrained to have zero degrees of freedom, treating as constant'.format(name))
+                        constants[name] = p[name]
+                    else:
+                        if name == 'Q' or name == 'R':
+                            param = util.inverse_constrained_cholesky(f, D, np.linalg.cholesky(p[name]))
+                        else:
+                            param = np.linalg.pinv(D) @ (p[name].flatten() - f)
+    
+                        args.append(param)
+                else:
+                    args.append(p[name].flatten())
+            else:
                 constants[name] = p[name]
 
+        i = 0
+        def kl(*args, **kwargs):
+            l = kalman_likelihood(*args, **kwargs)
+            
+            nonlocal i
+            i += 1            
+            if i % 100 == 0:
+                print('[{}] ll: {:.2f}'.format(i, -l))
+
+            return l
+
+        params = np.concatenate(args)
+        print('Starting likelihood: {:.2f} ({:.2f})'.format(
+            -kalman_likelihood(params, constants, self.Q.shape[0], y, self.constraints),
+            self.log_likelihood(y)
+        ))
+
         r = sp.optimize.minimize(
-            kalman_likelihood,
-            np.concatenate(args),
+            kl,
+            params,
             (
                 constants,
                 self.Q.shape[0],
                 y,
                 self.constraints
-            )
+            ),
+            method=method
         )
 
         Phi, A, Q, R, x0, E0 = unflatten_kalman_params(
@@ -290,8 +318,13 @@ def extract_parameter(i, params, shape, constraint, cholesky=False):
         f, D = constraint
         P = params[i:i+D.shape[1]]
         i += D.shape[1]
-        L = util.constrained_cholesky(f, D, P)
-        P = L @ L.T
+        
+        if cholesky == True:
+            L = util.constrained_cholesky(f, D, P)
+            P = L @ L.T
+        else:
+            P = f + D @ P
+            P = P.reshape(shape)
     elif cholesky == True:
         n = (shape[0] * (shape[1] - 1)) // 2 + shape[0]
         P = params[i:i+n]
@@ -312,7 +345,7 @@ def unflatten_kalman_params(params, state_dim, obs_dim, args, constraints):
         Phi = args['Phi']
     else:
         Phi, i = extract_parameter(i, params, (state_dim, state_dim), constraints['Phi'] if 'Phi' in constraints else None)
-    
+
     if 'A' in args:
         A = args['A']
     else:

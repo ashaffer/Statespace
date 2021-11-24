@@ -117,7 +117,7 @@ def cholesky_value(L, i, j, c):
     else:
         return (c - sum(L[i][k] * L[j][k] for k in range(j))) / L[j][j]
 
-def constrained_cholesky(f, D, r):
+def constrained_cholesky(f, D, r, eps=1e-8):
     dim = int(np.sqrt(f.shape[0]))
     L = np.zeros((dim, dim))
     v = np.zeros(r.shape)
@@ -139,7 +139,19 @@ def constrained_cholesky(f, D, r):
                     # While this variable is still undetermined,
                     # pull out the next unused rv from the vector
                     v[k] = 1.0
-                    L[i][j] = f[p] + r[k]
+                    if i != j:
+                        # If we have an offset for this value, we need to divide
+                        # it by L[j]j] as it would have originally been                        
+                        L[i][j] = f[p] / L[j][j] + r[k]
+                    else:
+                        # The floor for this value is f[p] minus the squared sum
+                        # of the prior diagonals. This minimum value would produce
+                        # a diagonal of exactly f[p] if nothing was added to it.
+                        a = f[p] - sum(L[j][m] ** 2 for m in range(i))
+                        # Ensure that this value is always at least epsilon
+                        # above zero, since it's a variance
+                        L[i][j] = np.sqrt(max(a, 0)) + np.exp(r[k]) - (1 - eps)
+ 
                     used = True
                     break
             
@@ -156,3 +168,28 @@ def constrained_cholesky(f, D, r):
                 C = f + D @ z
                 L[i][j] = cholesky_value(L, i, j, C[p])
     return L
+
+def inverse_constrained_cholesky(f, D, L, eps=1e-8):
+    Lp = np.full(L.shape, 0.0)
+    dim = int(np.sqrt(f.shape[0]))
+
+    for p in range(f.shape[0]):
+        i = p // dim
+        j = p % dim
+        if j > i:
+            continue
+
+        if np.any(D[p] != 0.0):
+            if i != j:
+                Lp[i][j] = L[i][j]
+            else:
+                Lp[i][j] = np.log(L[i][j] + (1 - eps))
+
+    return np.linalg.pinv(D) @ Lp.flatten()
+
+def validate_cholesky(f, D, C):
+    v = inverse_constrained_cholesky(f, D, np.linalg.cholesky(C))
+    L2 = constrained_cholesky(f, D, v)
+    C2 = L2 @ L2.T
+    if not np.allclose(C, C2):
+        print('invalid constraint inverse')
