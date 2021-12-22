@@ -193,3 +193,16 @@ def validate_cholesky(f, D, C):
     C2 = L2 @ L2.T
     if not np.allclose(C, C2):
         print('invalid constraint inverse')
+
+def sqrtm(M):
+    if M.ndim == 3:
+        return np.array([sqrtm(M[i]) for i in range(M.shape[0])])
+    else:
+        return sp.linalg.sqrtm(M)
+
+def solve_stationary(A):
+    A = A - np.eye(A.shape[0])
+    A[-1] = np.ones(A.shape[0])
+    b = np.zeros(A.shape[0])
+    b[-1] = 1.0
+    return sp.linalg.solve(A, b, transposed=False)
