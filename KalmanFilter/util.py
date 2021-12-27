@@ -206,3 +206,7 @@ def solve_stationary(A):
     b = np.zeros(A.shape[0])
     b[-1] = 1.0
     return sp.linalg.solve(A, b, transposed=False)
+
+def roll_tile(x, n):
+    b = x.dtype.itemsize
+    return np.lib.stride_tricks.as_strided(x, shape=(x.shape[0], n), strides=(b, b))

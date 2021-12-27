@@ -28,11 +28,12 @@ class HMM:
 		pred = []
 		filtered = []
 
-		for v in y:
+		py = self.pdf(y).T
+
+		for i,v in enumerate(y):
 			ptt1 = pt @ self.Phi
 			state = np.zeros(self.state_dim)
-			py = self.pdf(v)
-			pt = (py * ptt1) / (py @ ptt1)
+			pt = (py[i] * ptt1) / (py[i] @ ptt1)
 			
 			pred.append(ptt1)
 			filtered.append(pt)
@@ -60,7 +61,7 @@ class HMM:
 		ptp, ptf = self.filter(y)
 		pnt = ptf[-1]
 		states = [pnt]
-		py = self.pdf(y[-1])
+		py = self.pdf(y).T
 		p = np.ones(self.pi.shape)
 		pxns = []
 		# pxns = [((1 / p) * pnt * (self.Phi * py).T).T]
@@ -73,18 +74,18 @@ class HMM:
 				p = p / p.sum()
 
 			prevp = p
-			p = self.Phi @ (py * p)
+			pyv = py[-(i + 1)]
+			p = self.Phi @ (pyv * p)
 
 			ptt = ptf[-(i + 2)]
 			pnt = (ptt * p) / (ptt @ p)
-			pxn = (pnt * (self.Phi * py * prevp).T / p).T
+			pxn = (pnt * (self.Phi * pyv * prevp).T / p).T
 			
 			states.append(pnt)
 			pxns.append(pxn)
-			py = self.pdf(v)
 
 		prevp = p
-		p = self.Phi @ (py * p)
+		p = self.Phi @ (py[0] * p)
 		pn0 = (self.pi * p) / (self.pi @ p)
 
 		states = list(reversed(states))
@@ -287,6 +288,73 @@ class GaussianHMM(HMM):
 		means = (y @ st) / sts
 		s2 = ((y ** 2 @ st) / sts) - (means ** 2)
 		return self.create_dists(means, s2)
+
+class GaussianAR(sp.stats.rv_continuous):
+	def __init__(self, alpha, betas, s2):
+		self.alpha = alpha
+		self.betas = np.array(betas)
+		self.s2 = s2
+		self.dist = self
+
+	def params(self):
+		return np.array([self.alpha, *self.betas, self.s2])
+
+	def mean(self):
+		return np.nanfs
+
+	def var(self):
+		return self.s2
+
+	def std(self):
+		return self.var() ** 0.5
+
+	def pdf(self, x):
+		n = len(self.betas)
+		xr = np.lib.stride_tricks.sliding_window_view(x, n, axis=0)[:-1]
+		mus = self.alpha + xr @ self.betas
+		# The sliding window will chop off the first len(self.betas) - 1 elements, so fill
+		# in all these with alpha
+		first_mus = np.full(len(self.betas), self.alpha)
+		mus = np.concatenate((first_mus, mus))
+		e = (x - mus) ** 2 / (2 * self.s2)
+		return np.exp(-e) / np.sqrt(2 * np.pi * self.s2)
+
+class GaussianArHMM(HMM):
+	dist = GaussianAR
+
+	def __init__(self, Phi, alphas, betas, s2, **kwargs):
+		HMM.__init__(self, Phi, self.create_dists(alphas, betas, s2), **kwargs)
+
+	def create_dists(self, alphas, betas, s2):
+		return [
+			GaussianAR(alphas[i], betas[i], s2[i]) for i in range(len(alphas))
+		]
+
+	def em_distributions(self, st, pxns, y):
+		alphas = []
+		betas = []
+		s2s = []
+
+		for i in range(st.shape[1]):
+			n = len(self.dists[i].betas)
+			w = st[:,i][n:]
+			X = np.lib.stride_tricks.sliding_window_view(y, n, axis=0)[:-1]
+			X = np.hstack((X, np.expand_dims(np.ones(X.shape[0]), [1])))
+			# Compute a weighted least squares regression, using the state probabilities
+			# as weights, and adding an intercept
+			# p = np.linalg.inv(X.T @ W @ X) @ X.T @ W @ y[n:]
+			p = np.linalg.pinv(X * w[:, None]) @ (y[n:] * w)
+			beta, alpha = p[:-1], p[-1]
+			alphas.append(alpha)
+			betas.append(beta)
+
+			# Compute the conditional means using our new alphas and betas
+			means = X @ p
+			resid = y[n:] - means
+			s2 = ((resid ** 2) * w).sum() / w.sum()
+			s2s.append(s2)
+
+		return self.create_dists(alphas, betas, s2s)
 
 def create_hmm(params, state_dim, cls):
 	i = 0
