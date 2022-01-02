@@ -75,8 +75,8 @@ class KalmanFilter:
         ks = []
 
         # Pre-compute the state and obs intercepts for the whole series
-        xa = (C @ state_exog.T).T
-        ya = (U @ obs_exog.T).T
+        xa = C @ state_exog
+        ya = U @ obs_exog
         xtt = x0
         Ptt = E0
 
@@ -107,6 +107,50 @@ class KalmanFilter:
         ptf = np.array(ptf)
         ks = np.array(ks)
         return xp, ptp, xf, ptf, ks
+
+    def predict_once(self, i, xtt, Ptt, xa, ya):
+        Phi, A, C, Q, R, U, x0, E0 = self.params()
+
+        Phii = Phi if Phi.ndim == 2 else Phi[i]
+        Ai = A if A.ndim == 2 else A[i]
+
+        xtt1 = Phii @ xtt + xa
+        Ptt1 = (Phii @ Ptt @ Phii.T) + Qi
+
+        return xtt1, Ptt1
+
+    def filter_once(self, i, xtt, Ptt, y, xa=0, ya=0):
+        Phi, A, C, Q, R, U, x0, E0 = self.params()
+
+        xtt = x0 if xtt is None else xtt
+        Ptt = E0 if Ptt is None else Ptt
+
+        Phii = Phi if Phi.ndim == 2 else Phi[i]
+        Qi = Q if Q.ndim == 2 else Q[i]
+        Ai = A if A.ndim == 2 else A[i]
+        Ri = R if R.ndim == 2 else R[i]
+
+        xtt1 = Phii @ xtt + xa
+        Ptt1 = (Phii @ Ptt @ Phii.T) + Qi
+        
+        resid = y - Ai @ xtt1 - ya
+        K = Ptt1 @ Ai.T @ np.linalg.pinv(Ai @ Ptt1 @ Ai.T + Ri)
+        Ptt = (np.eye(Ptt1.shape[0]) - K @ Ai) @ Ptt1
+        xtt = xtt1 + K @ resid
+
+        return xtt1, xtt, Ptt1, Ptt, K
+
+    def likelihood_once(self, i, xtt1, Ptt1, y, ya=0):
+        Phi, A, C, Q, R, U, x0, E0 = self.params()
+
+        Ai = A if A.ndim == 2 else A[i]
+        Ri = R if R.ndim == 2 else R[i]
+
+        return util.multivariate_normal_density(
+            y,
+            Ai @ xtt1 + ya,
+            Ai @ Ptt1 @ Ai.T + R
+        )
 
     def smooth(self, y, state_exog=None, obs_exog=None):
         Phi, A, C, Q, R, U, x0, E0 = self.params()
@@ -166,7 +210,7 @@ class KalmanFilter:
         At = A.T if A.ndim == 2 else np.transpose(A, axes=[0, 2, 1])
         return util.log_multivariate_normal(y, A @ xp + ya, A @ ptp @ At + R).sum()
 
-    def expect(self, y, state_exog=None, obs_exog=None):
+    def expect(self, y, state_exog=None, obs_exog=None, weights=None):
         if type(state_exog) == type(None):
             state_exog = self.default_state_exog(y)
         if type(obs_exog) == type(None):
@@ -183,12 +227,20 @@ class KalmanFilter:
         s00 = (xx @ np.transpose(xx, axes=[0, 2, 1]) + ptpt)
 
         xa = C @ state_exog
-        ya = U @ obs_exog
-        
-        if A.ndim == 2:
-            e = y - (A @ x) - ya
-        else:
-            e = y - (A @ x) - ya
+        ya = U @ obs_exog    
+        e = y - (A @ x) - ya
+
+        # Allow the EM calculation to be weighted, for use in doing inference
+        # on HMM models wrapping Kalman filters
+        if weights is None:
+            weights = np.ones(y.shape[0])
+
+        if weights.ndim == 1:
+            weights = np.expand_dims(weights, [1, 2])
+
+        # For expectations involving a lag, use an average of the prior and current weights (with the zeroth weight)
+        # just representing itself).
+        sweights = np.concatenate((np.expand_dims(w[0], [0]), (w[1:] + w[:-1]) / 2))
 
         return x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_
         
@@ -207,6 +259,36 @@ class KalmanFilter:
 
     def debug(self, *args):
         return self.log(*args, level='debug')
+
+    def em_Phi(x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_):
+        Phi, A, C, Q, R, U, x0, E0 = self.params()
+
+        if Phi.ndim > 2:
+            raise ValueError('Cannot optimize Phi when it is initialized to be time-varying')
+
+        x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = expect()
+        xt = np.transpose(x, axes=[0, 2, 1])
+        xxt = np.transpose(xx, axes=[0, 2, 1])
+
+        if 'Phi' in self.constraints:
+            Qi = np.linalg.inv(Q)
+            f, D = self.constraints['Phi']
+            qk = np.kron(Qi, s00)
+            Phi1 = (Qi @ s10).reshape((s10.shape[0], Q.shape[1] ** 2))
+            Phi1 -= qk @ f
+            Phi1 -= (Qi @ xa @ xxt).reshape(Phi1.shape)
+            Phi1 = Phi1 @ D
+            Phi2 = D.T @ qk @ D
+            phi = np.linalg.inv(Phi2.sum(axis=0)) @ Phi1.sum(axis=0)
+            phi = f + D @ phi
+            Phi = phi.reshape(Phi.shape)
+        else:
+            s00inv = util.safe_inverse(s00.sum(axis=0))
+            r = s10 - xa @ xxt
+            Phi = (s10 - xa @ xxt).sum(axis=0) @ s00inv
+
+        return Phi
+
 
     def em_iter(self, y, state_exog=None, obs_exog=None, em_vars=['Phi', 'Q', 'A', 'C', 'R', 'U', 'x0', 'E0'], strict=False):
         if type(state_exog) == type(None):
@@ -261,6 +343,7 @@ class KalmanFilter:
                 self.Phi = Phi = phi.reshape(Phi.shape)
             else:
                 s00inv = util.safe_inverse(s00.sum(axis=0))
+                r = s10 - xa @ xxt
                 self.Phi = Phi = (s10 - xa @ xxt).sum(axis=0) @ s00inv
 
             debug_ll('Phi')

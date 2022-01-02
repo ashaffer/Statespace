@@ -27,6 +27,15 @@ def solve_triangular(L, Y):
     
     return np.array(arr)
 
+def multivariate_normal_density(x, mu, C):
+    resid = x - mu
+    e = -0.5 * resid.T @ np.linalg.inv(C) @ resid
+    return np.exp(e) / np.sqrt((2 * np.pi) ** x.shape[0] * np.linalg.det(C))
+
+def normal_density(x, mu, s2):
+    e = (x - mu) ** 2 / (2 * s2)
+    return np.exp(-e) / np.sqrt(2 * np.pi * s2)
+
 def log_multivariate_normal(x, mu, C, min_covar=1.e-7):
     try:
         try:

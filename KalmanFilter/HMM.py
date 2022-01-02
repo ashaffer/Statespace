@@ -1,15 +1,16 @@
 import numpy as np
 import scipy as sp
 from . import util
-from hmmlearn.hmm import GaussianHMM as hl_GaussianHMM
+# from hmmlearn.hmm import GaussianHMM as hl_GaussianHMM
+from .KalmanFilter import KalmanFilter
 
-def cloneHmmLearn(gh):
-    model = hl_GaussianHMM(n_components=gh.Phi.shape[0], covariance_type='diag')
-    model.startprob_ = gh.pi
-    model.transmat_ = gh.Phi
-    model.means_ = np.expand_dims(np.array([x.mean() for x in gh.dists]), [1])
-    model.covars_ = np.expand_dims(np.array([x.var() for x in gh.dists]), [1])
-    return model
+# def cloneHmmLearn(gh):
+#     model = hl_GaussianHMM(n_components=gh.Phi.shape[0], covariance_type='diag')
+#     model.startprob_ = gh.pi
+#     model.transmat_ = gh.Phi
+#     model.means_ = np.expand_dims(np.array([x.mean() for x in gh.dists]), [1])
+#     model.covars_ = np.expand_dims(np.array([x.var() for x in gh.dists]), [1])
+#     return model
 
 class HMM:
 	def __init__(self, Phi, dists, pi=None):
@@ -20,7 +21,7 @@ class HMM:
 		self.pi = util.solve_stationary(Phi.T) if type(pi) == type(None) else pi
 		self.state_dim = self.Phi.shape[0]
 
-	def filter(self, y):
+	def _filter_independent(self, y):
 		# My textbook and other implementations seem to set ptt1 = self.pi rather than pt,
 		# but the EM algorithm decreases in likelihood occasionally when I do it that way, and
 		# this way it does not. It also seems more logical this way to me.
@@ -32,15 +33,44 @@ class HMM:
 
 		for i,v in enumerate(y):
 			ptt1 = pt @ self.Phi
-			state = np.zeros(self.state_dim)
 			pt = (py[i] * ptt1) / (py[i] @ ptt1)
 			
 			pred.append(ptt1)
 			filtered.append(pt)
 
-		return np.array(pred), np.array(filtered)
+		return np.array(pred), np.array(filtered), py
 
-	def pdf(self, val):
+	def _filter_dependent(self, y, **kwargs):
+		pt = self.pi
+		pred = []
+		filtered = []
+
+		state = None
+		pys = []
+		xtts = []
+
+		for i,v in enumerate(y):
+			ptt1 = pt @ self.Phi
+			pt, py, state = self.pdf_once(i, v, pt=ptt1, state=state, **kwargs)
+
+			pred.append(ptt1)
+			filtered.append(pt)
+			pys.append(py)
+			xtts.append(state[0])
+
+
+		py = np.array(pys)
+		xtts = np.array(xtts)
+		return np.array(pred), np.array(filtered), py, xtts
+
+	def filter(self, y, **kwargs):
+		return self._filter_independent(y, **kwargs)
+
+	def filter_once(self, pt, py):
+		ptt1 = pt @ self.Phi
+		return (py * ptt1) / (py @ ptt1)
+
+	def pdf(self, val, pt=None, state=None):
 		result = []
 
 		for d in self.dists:
@@ -58,13 +88,11 @@ class HMM:
 		return np.array(result)
 
 	def smooth(self, y, eps=1e-12):
-		ptp, ptf = self.filter(y)
+		ptp, ptf, py, xtts = self.filter(y)
 		pnt = ptf[-1]
 		states = [pnt]
-		py = self.pdf(y).T
 		p = np.ones(self.pi.shape)
 		pxns = []
-		# pxns = [((1 / p) * pnt * (self.Phi * py).T).T]
 
 		for i,v in enumerate(reversed(y[:-1])):
 			# We only care about using the relative weights of p, and if we alllow it to recursively
@@ -107,9 +135,8 @@ class HMM:
 		return np.array(states), np.array(vals)
 
 	def log_likelihood(self, y):
-		ptp, ptf = self.filter(y)
-		py = np.squeeze(self.pdf(y))
-		dv = (ptp * py.T).sum(axis=1) # Probability weighted sum of the masses
+		ptp, ptf, py, xtts = self.filter(y)
+		dv = (ptp * py).sum(axis=1) # Probability weighted sum of the masses
 		return np.log(dv).sum()
 
 	def minimize(self, y, method='BFGS'):
@@ -243,8 +270,7 @@ class Normal(sp.stats.rv_continuous):
 		return self.s2 ** 0.5
 
 	def pdf(self, x):
-		e = (x - self.mu) ** 2 / (2 * self.s2)
-		return np.exp(-e) / np.sqrt(2 * np.pi * self.s2)
+		return util.normal_density(x, self.mu, self.s2)
 
 class PoissonHMM(HMM):
 	dist = Poisson
@@ -300,7 +326,7 @@ class GaussianAR(sp.stats.rv_continuous):
 		return np.array([self.alpha, *self.betas, self.s2])
 
 	def mean(self):
-		return np.nanfs
+		return np.nan
 
 	def var(self):
 		return self.s2
@@ -355,6 +381,77 @@ class GaussianArHMM(HMM):
 			s2s.append(s2)
 
 		return self.create_dists(alphas, betas, s2s)
+
+class KalmanDist(HMM):
+	def __init__(self, *args, **kwargs):
+		self.kf = KalmanFilter(*args, **kwargs)
+
+	def params(self):
+		return self.kf.params()
+
+	def mean(self):
+		return np.nan
+
+	def var(self):
+		return np.nan
+
+	def std(self):
+		return self.var() ** 0.5
+
+	def pdf(self, x):
+		pass
+
+class KalmanHMM(HMM):
+	dist = KalmanDist
+
+	def __init__(self, Phi, kfs, **kwargs):
+		self.kfs = kfs
+		HMM.__init__(self, Phi, kfs, **kwargs)
+
+	def pdf_once(self, i, y, pt, state, state_exog=None, obs_exog=None):
+		if state is not None:
+			xtt, Ptt, K = state
+		else:
+			xtt = None
+			Ptt = None
+
+		xtts = []
+		Ptts = []
+		Ks = []
+		pys = []
+
+		y = y if type(y) == np.ndarray else np.array([y])
+
+		for kf in self.kfs:
+			xa = kf.C if state_exog is None else kf.C @ state_exog[i]
+			ya = kf.U if obs_exog is None else kf.U @ obs_exog[i]
+
+			pxtt1, pxtt, pPtt1, pPtt, pK = kf.filter_once(i, xtt, Ptt, y, xa, ya)
+			py = kf.likelihood_once(i, pxtt1, pPtt1, y, ya)
+
+			pys.append(py)
+			xtts.append(pxtt)
+			Ptts.append(pPtt)
+			Ks.append(pK)
+
+		xtts = np.array(xtts)
+		Ptts = np.array(Ptts)
+		Ks = np.array(Ks)
+		pys = np.array(pys)
+
+		oxtt = xtt
+
+		py = np.squeeze(pys)
+		pt = (py * pt) / (py @ pt)
+		pte = np.expand_dims(pt, [1, 2])
+		xtt = (xtts * pte).sum(0)
+		Ptt = (Ptts * pte).sum(0)
+		K = (Ks * pte).sum(0)
+
+		return pt, py, (xtt, Ptt, K)
+
+	def filter(self, y):
+		return self._filter_dependent(y)
 
 def create_hmm(params, state_dim, cls):
 	i = 0
