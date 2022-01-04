@@ -21,7 +21,7 @@ class HMM:
 		self.pi = util.solve_stationary(Phi.T) if type(pi) == type(None) else pi
 		self.state_dim = self.Phi.shape[0]
 
-	def _filter_independent(self, y):
+	def filter(self, y):
 		# My textbook and other implementations seem to set ptt1 = self.pi rather than pt,
 		# but the EM algorithm decreases in likelihood occasionally when I do it that way, and
 		# this way it does not. It also seems more logical this way to me.
@@ -40,7 +40,7 @@ class HMM:
 
 		return np.array(pred), np.array(filtered), py
 
-	def _filter_dependent(self, y, **kwargs):
+	def filter_states(self, y, **kwargs):
 		pt = self.pi
 		pred = []
 		filtered = []
@@ -48,23 +48,27 @@ class HMM:
 		state = None
 		pys = []
 		xtts = []
+		Ptts = []
+		Ks = []
 
 		for i,v in enumerate(y):
 			ptt1 = pt @ self.Phi
 			pt, py, state = self.pdf_once(i, v, pt=ptt1, state=state, **kwargs)
+			xtt, Ptt, K = state
 
 			pred.append(ptt1)
 			filtered.append(pt)
 			pys.append(py)
-			xtts.append(state[0])
-
+			xtts.append(xtt)
+			Ptts.append(Ptt)
+			Ks.append(K)
 
 		py = np.array(pys)
 		xtts = np.array(xtts)
-		return np.array(pred), np.array(filtered), py, xtts
+		Ptts = np.array(Ptts)
+		Ks = np.array(Ks)
 
-	def filter(self, y, **kwargs):
-		return self._filter_independent(y, **kwargs)
+		return np.array(pred), np.array(filtered), py, xtts, Ptts, Ks
 
 	def filter_once(self, pt, py):
 		ptt1 = pt @ self.Phi
@@ -87,8 +91,8 @@ class HMM:
 
 		return np.array(result)
 
-	def smooth(self, y, eps=1e-12):
-		ptp, ptf, py, xtts = self.filter(y)
+	def smooth(self, y):
+		ptp, ptf, py = self.filter(y)
 		pnt = ptf[-1]
 		states = [pnt]
 		p = np.ones(self.pi.shape)
@@ -193,7 +197,7 @@ class HMM:
 
 			prev_ll = ll
 
-	def em_iter(self, y, exclude_dists=False, strict=False):
+	def em_iter(self, y, exclude_dists=False, strict=False, em_vars=['pi', 'Phi']):
 		cached = None
 		prev_ll = -np.inf
 
@@ -218,11 +222,13 @@ class HMM:
 
 			return cached
 
-		st, pxns, p0 = smooth('pi')
-		self.pi = p0
+		if 'pi' in em_vars:
+			st, pxns, p0 = smooth('pi')
+			self.pi = p0
 
-		st, pxns, p0 = smooth('Phi')
-		self.Phi = (pxns.sum(0).T / pxns.sum(2).sum(0)).T
+		if 'Phi' in em_vars:
+			st, pxns, p0 = smooth('Phi')
+			self.Phi = (pxns.sum(0).T / pxns.sum(2).sum(0)).T
 
 		if exclude_dists == False:
 			st, pxns, p0 = smooth('Dists')
@@ -449,9 +455,6 @@ class KalmanHMM(HMM):
 		K = (Ks * pte).sum(0)
 
 		return pt, py, (xtt, Ptt, K)
-
-	def filter(self, y):
-		return self._filter_dependent(y)
 
 def create_hmm(params, state_dim, cls):
 	i = 0

@@ -57,192 +57,28 @@ class KalmanFilter:
             'E0': self.E0,
         }
 
-    def params(self):
-        return self.Phi, self.A, self.C, self.Q, self.R, self.U, self.x0, self.E0
-
-    def filter(self, y, state_exog=None, obs_exog=None):
+    def params(self, state_exog, obs_exog, y):
         if type(state_exog) == type(None):
             state_exog = self.default_state_exog(y)
         if type(obs_exog) == type(None):
             obs_exog = self.default_obs_exog(y)
 
-        Phi, A, C, Q, R, U, x0, E0 = self.params()
+        return self.Phi, self.A, self.C, self.Q, self.R, self.U, self.x0, self.E0, state_exog, obs_exog
 
-        xp = []
-        xf = []
-        ptf = []
-        ptp = []
-        ks = []
-
-        # Pre-compute the state and obs intercepts for the whole series
-        xa = C @ state_exog
-        ya = U @ obs_exog
-        xtt = x0
-        Ptt = E0
-
-        for i,v in enumerate(y):
-            Phii = Phi if Phi.ndim == 2 else Phi[i]
-            Qi = Q if Q.ndim == 2 else Q[i]
-            Ai = A if A.ndim == 2 else A[i]
-            Ri = R if R.ndim == 2 else R[i]
-
-            xtt1 = Phii @ xtt + xa[i]
-            Ptt1 = (Phii @ Ptt @ Phii.T) + Qi
-
-            xp.append(xtt1)
-            ptp.append(Ptt1)
-            
-            resid = v - Ai @ xtt1 - ya[i]
-            K = Ptt1 @ Ai.T @ np.linalg.pinv(Ai @ Ptt1 @ Ai.T + Ri)
-            Ptt = (np.eye(Ptt1.shape[0]) - K @ Ai) @ Ptt1
-            xtt = xtt1 + K @ resid
-
-            xf.append(xtt)
-            ptf.append(Ptt)
-            ks.append(K)
-        
-        xp = np.array(xp)
-        ptp = np.array(ptp)
-        xf = np.array(xf)
-        ptf = np.array(ptf)
-        ks = np.array(ks)
-        return xp, ptp, xf, ptf, ks
-
-    def predict_once(self, i, xtt, Ptt, xa, ya):
-        Phi, A, C, Q, R, U, x0, E0 = self.params()
-
-        Phii = Phi if Phi.ndim == 2 else Phi[i]
-        Ai = A if A.ndim == 2 else A[i]
-
-        xtt1 = Phii @ xtt + xa
-        Ptt1 = (Phii @ Ptt @ Phii.T) + Qi
-
-        return xtt1, Ptt1
-
-    def filter_once(self, i, xtt, Ptt, y, xa=0, ya=0):
-        Phi, A, C, Q, R, U, x0, E0 = self.params()
-
-        xtt = x0 if xtt is None else xtt
-        Ptt = E0 if Ptt is None else Ptt
-
-        Phii = Phi if Phi.ndim == 2 else Phi[i]
-        Qi = Q if Q.ndim == 2 else Q[i]
-        Ai = A if A.ndim == 2 else A[i]
-        Ri = R if R.ndim == 2 else R[i]
-
-        xtt1 = Phii @ xtt + xa
-        Ptt1 = (Phii @ Ptt @ Phii.T) + Qi
-        
-        resid = y - Ai @ xtt1 - ya
-        K = Ptt1 @ Ai.T @ np.linalg.pinv(Ai @ Ptt1 @ Ai.T + Ri)
-        Ptt = (np.eye(Ptt1.shape[0]) - K @ Ai) @ Ptt1
-        xtt = xtt1 + K @ resid
-
-        return xtt1, xtt, Ptt1, Ptt, K
-
-    def likelihood_once(self, i, xtt1, Ptt1, y, ya=0):
-        Phi, A, C, Q, R, U, x0, E0 = self.params()
-
-        Ai = A if A.ndim == 2 else A[i]
-        Ri = R if R.ndim == 2 else R[i]
-
-        return util.multivariate_normal_density(
-            y,
-            Ai @ xtt1 + ya,
-            Ai @ Ptt1 @ Ai.T + R
+    def filter(self, y, state_exog=None, obs_exog=None):
+        return kf_filter(
+            self.params(state_exog, obs_exog, y),
+            y
         )
 
     def smooth(self, y, state_exog=None, obs_exog=None):
-        Phi, A, C, Q, R, U, x0, E0 = self.params()
-        xp, ptp, xf, ptf, ks = self.filter(y, state_exog=state_exog, obs_exog=obs_exog)
-        
-        xs = [xf[-1]]
-        pts = [ptf[-1]]
-        ptt1s = []
-
-        Ai = A if A.ndim == 2 else A[-1]
-        Phii = Phi if Phi.ndim == 2 else Phi[-1]
-
-        # Pn_n1_n = (I - K_n1 @ A) @ phi @ Pn_n1
-        I = np.eye(ks[-1].shape[0])
-        Pntt1 = (I - ks[-1] @ Ai) @ Phii @ ptf[-2]
-        ptt1s.append(Pntt1)
-            
-        for i,v in enumerate(reversed(xf)):
-            Phii = Phi if Phi.ndim == 2 else Phi[i]
-            Qi = Q if Q.ndim == 2 else Q[i]
-
-            Ptt = ptf[-(i + 2)] if i < len(y) - 1 else E0
-            Ptt1 = ptp[-(i + 1)]
-            J = Ptt @ Phii.T @ np.linalg.pinv(Ptt1)
-
-            xtt = xf[-(i + 2)] if i < len(y) - 1 else x0
-            xtt1 = xp[-(i + 1)]
-            xnt = xtt + J @ (xs[-1] - xtt1)
-            Pnt = Ptt + J @ (pts[-1] - Ptt1) @ J.T
-            
-            ptt1s.append(pts[-1] @ J.T)
-            xs.append(xnt)
-            pts.append(Pnt)
-
-        # Remember the lists are currently backwards, so
-        # x0 and E0 are at the end
-        *xs, x0 = xs
-        *pts, E0 = pts
-
-        xs = np.array(list(reversed(xs)))
-        pt = np.array(list(reversed(pts)))
-        ptt1s = np.array(list(reversed(ptt1s)))
-
-        return xs, pt, ptt1s, x0, E0
+        return kf_smooth(self.params(state_exog, obs_exog, y), y)
 
     def log_likelihood(self, y, state_exog=None, obs_exog=None, params=None):
-        if type(state_exog) == type(None):
-            state_exog = self.default_state_exog(y)
-        if type(obs_exog) == type(None):
-            obs_exog = self.default_obs_exog(y)
+        return kf_log_likelihood(self.params(state_exog, obs_exog, y), y)
 
-        params = self.params() if params == None else params
-        Phi, A, C, Q, R, U, x0, E0 = params
-        xp, ptp, xf, ptf, ks = self.filter(y)
-        ya = (U @ obs_exog.T).T
-
-        At = A.T if A.ndim == 2 else np.transpose(A, axes=[0, 2, 1])
-        return util.log_multivariate_normal(y, A @ xp + ya, A @ ptp @ At + R).sum()
-
-    def expect(self, y, state_exog=None, obs_exog=None, weights=None):
-        if type(state_exog) == type(None):
-            state_exog = self.default_state_exog(y)
-        if type(obs_exog) == type(None):
-            obs_exog = self.default_obs_exog(y)
-
-        Phi, A, C, Q, R, U, x0, E0 = self.params()
-        x, pt, ptt1, x0_, E0_ = self.smooth(y)
-
-        xx = np.concatenate((np.expand_dims(x0_, [0]), x[:-1]), axis=0)
-        ptpt = np.concatenate((np.expand_dims(E0_, [0]), pt[:-1]), axis=0)
-
-        s11 = (x @ np.transpose(x, axes=[0, 2, 1]) + pt)
-        s10 = (x @ np.transpose(xx, axes=[0, 2, 1]) + ptt1[:-1])
-        s00 = (xx @ np.transpose(xx, axes=[0, 2, 1]) + ptpt)
-
-        xa = C @ state_exog
-        ya = U @ obs_exog    
-        e = y - (A @ x) - ya
-
-        # Allow the EM calculation to be weighted, for use in doing inference
-        # on HMM models wrapping Kalman filters
-        if weights is None:
-            weights = np.ones(y.shape[0])
-
-        if weights.ndim == 1:
-            weights = np.expand_dims(weights, [1, 2])
-
-        # For expectations involving a lag, use an average of the prior and current weights (with the zeroth weight)
-        # just representing itself).
-        sweights = np.concatenate((np.expand_dims(w[0], [0]), (w[1:] + w[:-1]) / 2))
-
-        return x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_
+    def em_params(self, y, state_exog=None, obs_exog=None, smooth=None):
+        return kf_em_params(self.params(state_exog, obs_exog, y), y)
         
     log_levels = ['info', 'debug']
     log_level = 'info'
@@ -260,235 +96,25 @@ class KalmanFilter:
     def debug(self, *args):
         return self.log(*args, level='debug')
 
-    def em_Phi(x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_):
-        Phi, A, C, Q, R, U, x0, E0 = self.params()
-
-        if Phi.ndim > 2:
-            raise ValueError('Cannot optimize Phi when it is initialized to be time-varying')
-
-        x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = expect()
-        xt = np.transpose(x, axes=[0, 2, 1])
-        xxt = np.transpose(xx, axes=[0, 2, 1])
-
-        if 'Phi' in self.constraints:
-            Qi = np.linalg.inv(Q)
-            f, D = self.constraints['Phi']
-            qk = np.kron(Qi, s00)
-            Phi1 = (Qi @ s10).reshape((s10.shape[0], Q.shape[1] ** 2))
-            Phi1 -= qk @ f
-            Phi1 -= (Qi @ xa @ xxt).reshape(Phi1.shape)
-            Phi1 = Phi1 @ D
-            Phi2 = D.T @ qk @ D
-            phi = np.linalg.inv(Phi2.sum(axis=0)) @ Phi1.sum(axis=0)
-            phi = f + D @ phi
-            Phi = phi.reshape(Phi.shape)
-        else:
-            s00inv = util.safe_inverse(s00.sum(axis=0))
-            r = s10 - xa @ xxt
-            Phi = (s10 - xa @ xxt).sum(axis=0) @ s00inv
-
-        return Phi
-
-
     def em_iter(self, y, state_exog=None, obs_exog=None, em_vars=['Phi', 'Q', 'A', 'C', 'R', 'U', 'x0', 'E0'], strict=False):
-        if type(state_exog) == type(None):
-            state_exog = self.default_state_exog(y)
-        if type(obs_exog) == type(None):
-            obs_exog = self.default_obs_exog(y)
+        updated_params = kf_em_once(
+            self.params(state_exog, obs_exog, y), 
+            y, 
+            em_vars, 
+            strict=strict, 
+            constraints=self.constraints,
+            debug = self.log_level == 'debug'
+        )
 
-        Phi, A, C, Q, R, U, x0, E0 = self.params()
-        i = 0
-        result = None
-
-        def expect():
-            nonlocal i, result
-            
-            if i == 0 or strict == True:
-                result = self.expect(y, state_exog, obs_exog)
-
-            i += 1
-            return result
-
-        prev_ll = None
-        def debug_ll(param):
-            nonlocal prev_ll
-            # Do the if check here just to avoid computing the log_likelihood if we don't have to
-            if self.log_level == 'debug':
-                ll = self.log_likelihood(y, state_exog=state_exog, obs_exog=obs_exog)
-                self.debug('{}: {}'.format(param, ll))
-                
-                if prev_ll != None and prev_ll > ll + 1e-4:
-                    raise ValueError('{} likelihood decreased: {} -> {}'.format(param, prev_ll, ll))
-                prev_ll = ll
-
-        if 'Phi' in em_vars:
-            if Phi.ndim > 2:
-                raise ValueError('Cannot optimize Phi when it is initialized to be time-varying')
-
-            x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = expect()
-            xt = np.transpose(x, axes=[0, 2, 1])
-            xxt = np.transpose(xx, axes=[0, 2, 1])
-
-            if 'Phi' in self.constraints:
-                Qi = np.linalg.inv(Q)
-                f, D = self.constraints['Phi']
-                qk = np.kron(Qi, s00)
-                Phi1 = (Qi @ s10).reshape((s10.shape[0], Q.shape[1] ** 2))
-                Phi1 -= qk @ f
-                Phi1 -= (Qi @ xa @ xxt).reshape(Phi1.shape)
-                Phi1 = Phi1 @ D
-                Phi2 = D.T @ qk @ D
-                phi = np.linalg.inv(Phi2.sum(axis=0)) @ Phi1.sum(axis=0)
-                phi = f + D @ phi
-                self.Phi = Phi = phi.reshape(Phi.shape)
-            else:
-                s00inv = util.safe_inverse(s00.sum(axis=0))
-                r = s10 - xa @ xxt
-                self.Phi = Phi = (s10 - xa @ xxt).sum(axis=0) @ s00inv
-
-            debug_ll('Phi')
-
-        if 'Q' in em_vars:
-            if Q.ndim > 2:
-                raise ValueError('Cannot optimize Q when it is initialized to be time-varying')
-
-            x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = expect()
-            
-            s10t = np.transpose(s10, axes=[0, 2, 1])
-            xat = np.transpose(xa, axes=[0, 2, 1])
-            xt = np.transpose(x, axes=[0, 2, 1])
-            xxt = np.transpose(xx, axes=[0, 2, 1])
-
-            Q = (
-                s11 
-                    - s10 @ Phi.T 
-                    - Phi @ s10t 
-                    - x @ xat
-                    - xa @ xt 
-                    + Phi @ s00 @ Phi.T
-                    + Phi @ xx @ xat 
-                    + xa @ xxt @ Phi.T 
-                    + xa @ xat
-            )
-            
-            if 'Q' in self.constraints:
-                f, D = self.constraints['Q']
-                q = Q.reshape((Q.shape[0], Q.shape[1] ** 2))
-                q = np.linalg.inv(Q.shape[0] * D.T @ D) @ (q @ D).sum(axis=0)
-                q = f + D @ q
-                self.Q = Q = q.reshape(Q.shape[1:])
-            else:
-                self.Q = Q = Q.mean(axis=0)
-
-            debug_ll('Q')
-
-        if 'C' in em_vars:
-            if C.ndim > 2:
-                raise ValueError('Cannot optimize C when it is initialized to be time-varying')
-
-            x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = expect()
-
-            # The constraints are used to fit the exogenous coefficient matrix, this is why
-            # the user can't specify custom constraints here
-            f = np.zeros((C.shape[0] * C.shape[1], 1))
-            D = np.kron(np.eye(C.shape[0]), np.transpose(state_exog, axes=[0, 2, 1]))
-            Dt = np.transpose(D, axes=[0, 2, 1])
-            xxt = np.transpose(xx, axes=[0, 2, 1])
-
-            Qi = np.linalg.inv(Q)
-            C1 = np.linalg.inv((Dt @ Qi @ D).sum(axis=0))
-            C2 = (Dt @ Qi @ (x - np.kron(np.eye(Q.shape[0]), xxt) @ np.expand_dims(Phi.flatten(), [1]) - f)).sum(axis=0)
-            c = C1 @ C2
-            self.C = C = c.reshape(C.shape)
-            # self.C = C = (x - Phi @ xx).mean(axis=0)
-            # print(self.log_likelihood(y))
-            # xx[0] = x0
-            # self.C = C = (x - Phi @ xx).mean(axis=0)
-            debug_ll('C')
-
-        if 'x0' in em_vars:
-            x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = expect()
-            self.x0 = x0 = x0_
-            debug_ll('x0')
-
-        if 'E0' in em_vars:
-            x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = expect()
-            self.E0 = E0 = E0_
-            debug_ll('E0')
-
-        if 'A' in em_vars:
-            if A.ndim > 2:
-                raise ValueError('Cannot optimize A when it is initialized to be time-varying')
-
-            x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = expect()
-            xt = np.transpose(x, axes=[0, 2, 1])
-
-            if 'A' in self.constraints:
-                Ri = np.linalg.inv(R)
-
-                f, D = self.constraints['A']
-
-                # This is the reverse of the argument order used in the paper, but
-                # passing them the other way doesn't seem to work.
-                rk = np.kron(Ri, pt + x @ xt)
-                
-                A1 = Ri @ (y @ xt)
-                A1 = A1.reshape((A1.shape[0], R.shape[0] * Q.shape[0]))
-                A1 -= rk @ f
-                A1 -= (Ri @ ya @ xt).reshape(A1.shape)
-                A1 = A1 @ D
-
-                A2 = D.T @ rk @ D
-                a = np.linalg.inv(A2.sum(axis=0)) @ A1.sum(axis=0)
-                self.A = A = (f + D @ a).reshape(A.shape)
-            else:
-                A1 = (y @ xt - ya @ xt).sum(axis=0)
-                A2 = np.linalg.inv((pt + x @ xt).sum(axis=0))
-                self.A = A = A1 @ A2
-
-            debug_ll('A')
-
-        if 'U' in em_vars:
-            if U.ndim > 2:
-                raise ValueError('Cannot optimize U when it is initialized to be time-varying')
-
-            x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = expect()
-            f = np.zeros((U.shape[0] * U.shape[1], 1))
-            D = np.kron(np.eye(U.shape[0]), np.transpose(obs_exog, axes=[0, 2, 1]))
-            Dt = np.transpose(D, axes=[0, 2, 1])
-            
-            Ri = np.linalg.inv(R)
-            U1 = np.linalg.inv((Dt @ Ri @ D).sum(axis=0))
-            U2 = (Dt @ Ri @ (y - A @ x - f)).sum(axis=0)
-            u = U1 @ U2
-            self.U = U = u.reshape(U.shape)
-
-            debug_ll('U')
-
-        if 'R' in em_vars:
-            if R.ndim > 2:
-                raise ValueError('Cannot optimize R when it is initialized to be time-varying')
-
-            x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = expect()
-            resid = (e @ np.transpose(e, axes=[0, 2, 1]))
-            
-            if A.ndim == 2:
-                va = (A @ pt @ A.T)
-            else:
-                va = (A @ pt @ np.transpose(A, axes=[0, 2, 1]))
-
-            R = (resid + va)
-    
-            if 'R' in self.constraints:
-                f, D = self.constraints['R']
-                r = R.reshape((R.shape[0], R.shape[1] ** 2))
-                r = np.linalg.inv(R.shape[0] * D.T @ D) @ (r @ D).sum(axis=0)
-                r = f + D @ r
-                self.R = R = r.reshape(R.shape[1:])
-            else:
-                self.R = R = R.mean(axis=0)
-
-            debug_ll('R')
+        Phi, A, C, Q, R, U, x0, E0 = updated_params
+        self.Phi = Phi
+        self.A = A
+        self.C = C
+        self.Q = Q
+        self.R = R
+        self.U = U
+        self.x0 = x0
+        self.E0 = E0
 
     def em(self, y, state_exog=None, obs_exog=None, n=10, **kwargs):
         print('\t[0] ll: {:.2f}'.format(self.log_likelihood(y, state_exog=state_exog, obs_exog=obs_exog)))
@@ -517,11 +143,11 @@ class KalmanFilter:
             print('[{}] ll: {:.2f}'.format(n, ll))
 
     def innovations(self, y, **kwargs):
-        x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = self.expect(y, **kwargs)
+        x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = self.em_params(y, **kwargs)
         return e
 
     def standardized_innovations(self, y, **kwargs):
-        x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = self.expect(y, **kwargs)
+        x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = self.em_params(y, **kwargs)
         Phi, A, C, Q, R, U, x0, E0 = self.params()
         At = A.T if A.ndim == 2 else np.transpose(A, axes=[0, 2, 1])
         E = A @ pt @ At + R
@@ -786,3 +412,409 @@ def kalman_likelihood(params, args, state_dim, y, state_exog, obs_exog, constrai
     )
     
     return -kf.log_likelihood(y, state_exog=state_exog, obs_exog=obs_exog)
+
+
+import numpy as np
+import scipy as sp
+from . import util
+
+def kf_init_params(self, Phi, A, Q, R, x0=None, E0=None, C=None, U=None, constraints={}):
+    x0 = x0 if type(x0) != type(None) else np.zeros((Q.shape[0], 1))
+    E0 = E0 if type(E0) != type(None) else Q
+    C = np.zeros((Q.shape[0], 1)) if type(C) == type(None) else C
+    U = np.zeros((R.shape[0], 1)) if type(U) == type(None) else U
+
+    params = {
+        'Phi': Phi,
+        'A': A,
+        'Q': Q,
+        'R': R,
+        'x0': x0,
+        'E0': E0,
+        'C': C,
+        'U': U
+    }
+    
+    if 'C' in constraints:
+        raise ValueError('Constraints on C are not allowed')
+
+    if 'U' in constraints:
+        raise ValueError('Constraints on U are not allowed')
+
+    for key in constraints:
+        C = constraints[key]
+        if type(C) == str:
+            C = util.constraint_str_to_matrix(C, params[key].shape)
+
+        if type(C) == np.ndarray:
+            constraints[key] = util.constraint_matrices(C)
+
+    return params, constraints
+
+def kf_params_idx(params, i):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+
+    return (
+        Phi if Phi.ndim == 2 else Phi[i], 
+        A if A.ndim == 2 else A[i], 
+        C, 
+        Q if Q.ndim == 2 else Q[i], 
+        R if R.ndim == 2 else R[i], 
+        U, 
+        x0, 
+        E0
+    )
+
+def kf_filter_once(iparams, xtt, Ptt, y, xa=0, ya=0):
+    Phi, A, C, Q, R, U, x0, E0 = iparams
+
+    xtt = x0 if xtt is None else xtt
+    Ptt = E0 if Ptt is None else Ptt
+
+    xtt1 = Phi @ xtt + xa
+    Ptt1 = (Phi @ Ptt @ Phi.T) + Q
+    
+    resid = y - A @ xtt1 - ya
+    K = Ptt1 @ A.T @ np.linalg.pinv(A @ Ptt1 @ A.T + R)
+    Ptt = (np.eye(Ptt1.shape[0]) - K @ A) @ Ptt1
+    xtt = xtt1 + K @ resid
+
+    return xtt1, xtt, Ptt1, Ptt, K
+
+def kf_filter(params, y):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+
+    xp = []
+    xf = []
+    ptf = []
+    ptp = []
+    ks = []
+
+    # Pre-compute the state and obs intercepts for the whole series
+    xa = C @ state_exog
+    ya = U @ obs_exog
+    xtt = x0
+    Ptt = E0
+
+    for i,v in enumerate(y):
+        xtt1, xtt, Ptt1, Ptt, K = kf_filter_once(kf_params_idx(params, i), xtt, Ptt, v, xa[i], ya[i])
+        xp.append(xtt1)
+        xf.append(xtt)
+        ptp.append(Ptt1)
+        ptf.append(Ptt)
+        ks.append(K)
+
+    return (
+        np.array(xp),
+        np.array(ptp),
+        np.array(xf),
+        np.array(ptf),
+        np.array(ks)
+    )
+
+def kf_smooth_covariance_init(iparams, K, Pn1):
+    Phi, A, C, Q, R, U, x0, E0 = iparams    
+    I = np.eye(K.shape[0])
+    return (I - K @ A) @ Phi @ Pn1
+
+def kf_smooth_once(iparams, xs, Pts, xtt, xtt1, Ptt, xa=0, ya=0):
+    Phi, A, C, Q, R, U, x0, E0 = iparams
+    
+    Ptt1 = Phi @ Ptt @ Phi.T + Q
+    J = Ptt @ Phi.T @ np.linalg.pinv(Ptt1)
+
+    xnt = xtt + J @ (xs - xtt1)
+    Pnt = Ptt + J @ (Pts - Ptt1) @ J.T    
+    ptt1s = Pts @ J.T
+
+    return xnt, Pnt, ptt1s
+
+def kf_smooth(params, y):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params   
+    xp, ptp, xf, ptf, ks = kf_filter(params, y)
+
+    xs = [xf[-1]]
+    pts = [ptf[-1]]
+    ptt1s = [kf_smooth_covariance_init(kf_params_idx(params, -1), ks[-1], ptf[-2])]
+
+    for i in range(1, len(y)):
+        xnt, Pnt, Ptt1 = kf_smooth_once(
+            kf_params_idx(params, -i), 
+            xs[-1], 
+            pts[-1], 
+            xf[-(i + 1)], 
+            xp[-i], 
+            ptf[-(i + 1)]
+        )
+
+        xs.append(xnt)
+        pts.append(Pnt)
+        ptt1s.append(Ptt1)
+
+    x0, E0, Ptt0 = kf_smooth_once(kf_params_idx(params, 0), xs[-1], pts[-1], x0, xp[0], E0)
+    ptt1s.append(Ptt0)
+
+    return (
+        np.array(list(reversed(xs))),
+        np.array(list(reversed(pts))),
+        np.array(list(reversed(ptt1s))),
+        x0,
+        E0
+    )
+
+def kf_likelihood_once(iparams, xtt1, Ptt1, y, ya=0):
+    Phi, A, C, Q, R, U, x0, E0 = iparams
+
+    return util.multivariate_normal_density(
+        y,
+        A @ xtt1 + ya,
+        A @ Ptt1 @ A.T + R
+    )
+
+def kf_log_likelihood(params, y):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+
+    xp, ptp, xf, ptf, ks = kf_filter(params, y)
+    ya = (U @ obs_exog.T).T
+
+    At = A.T if A.ndim == 2 else np.transpose(A, axes=[0, 2, 1])
+    return util.log_multivariate_normal(y, A @ xp + ya, A @ ptp @ At + R).sum()
+
+
+def kf_em_once(params, y, em_vars, strict=False, constraints={}, debug=False):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+
+    # Order shouldn't matter if we're operating in strict mode where we re-compute the filters/smoothers
+    # on every iteration, but that's not the default, and I think order might matter in non-strict mode
+    em_fns = {
+        'Phi': kf_em_Phi, 
+        'Q': kf_em_Q,
+        'A': kf_em_A,
+        'C': kf_em_C,
+        'R': kf_em_R,
+        'U': kf_em_U,
+        'x0': kf_em_x0,
+        'E0': kf_em_E0
+    }
+    
+    em_params = kf_em_params(params, y)
+    prev_ll = None
+
+    # Note, it's important that these keys be initialized in the same order as params, not
+    # the same order as em_fns
+    result = {'Phi': Phi, 'A': A, 'C': C, 'Q': Q, 'R': R, 'U': U, 'x0': x0, 'E0': E0}
+
+    for i,v in enumerate(em_fns):
+        if v in em_vars:
+            result[v] = em_fns[v](params, y, em_params, constraints=constraints)
+
+            # Do the if check here just to avoid computing the log_likelihood if we don't have to
+            if debug == True:
+                ll = kf_log_likelihood(params, y)
+                print('{}: {}'.format(param, ll))
+                
+                if prev_ll != None and prev_ll > ll + 1e-4:
+                    raise ValueError('{} likelihood decreased: {} -> {}'.format(v, prev_ll, ll))
+                prev_ll = ll
+
+            if strict == True and i != len(ordered) - 1:
+                em_params = kf_em_params(params, y)
+
+    return tuple(result.values())
+
+def kf_em_params(params, y):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+    x, pt, ptt1, x0_, E0_ = kf_smooth(params, y)
+
+    xx = np.concatenate((np.expand_dims(x0_, [0]), x[:-1]), axis=0)
+    ptpt = np.concatenate((np.expand_dims(E0_, [0]), pt[:-1]), axis=0)
+
+    s11 = (x @ np.transpose(x, axes=[0, 2, 1]) + pt)
+    s10 = (x @ np.transpose(xx, axes=[0, 2, 1]) + ptt1[:-1])
+    s00 = (xx @ np.transpose(xx, axes=[0, 2, 1]) + ptpt)
+
+    xa = C @ state_exog
+    ya = U @ obs_exog
+    e = y - (A @ x) - ya
+
+    return x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_
+
+def kf_em_Phi(params, y, em_params, constraints={}):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+    x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = em_params
+
+    if Phi.ndim > 2:
+        raise ValueError('Cannot optimize Phi when it is initialized to be time-varying')
+
+    xt = np.transpose(x, axes=[0, 2, 1])
+    xxt = np.transpose(xx, axes=[0, 2, 1])
+
+    if 'Phi' in constraints:
+        Qi = np.linalg.inv(Q)
+        f, D = constraints['Phi']
+        qk = np.kron(Qi, s00)
+        Phi1 = (Qi @ s10).reshape((s10.shape[0], Q.shape[1] ** 2))
+        Phi1 -= qk @ f
+        Phi1 -= (Qi @ xa @ xxt).reshape(Phi1.shape)
+        Phi1 = Phi1 @ D
+        Phi2 = D.T @ qk @ D
+        phi = np.linalg.inv(Phi2.sum(axis=0)) @ Phi1.sum(axis=0)
+        phi = f + D @ phi
+        Phi = phi.reshape(Phi.shape)
+    else:
+        s00inv = util.safe_inverse(s00.sum(axis=0))
+        r = s10 - xa @ xxt
+        Phi = (s10 - xa @ xxt).sum(axis=0) @ s00inv
+
+    return Phi
+
+def kf_em_Q(params, y, em_params, constraints={}):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+    x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = em_params
+
+    if Q.ndim > 2:
+        raise ValueError('Cannot optimize Q when it is initialized to be time-varying')
+
+    s10t = np.transpose(s10, axes=[0, 2, 1])
+    xat = np.transpose(xa, axes=[0, 2, 1])
+    xt = np.transpose(x, axes=[0, 2, 1])
+    xxt = np.transpose(xx, axes=[0, 2, 1])
+
+    Q = (
+        s11 
+            - s10 @ Phi.T 
+            - Phi @ s10t 
+            - x @ xat
+            - xa @ xt 
+            + Phi @ s00 @ Phi.T
+            + Phi @ xx @ xat 
+            + xa @ xxt @ Phi.T 
+            + xa @ xat
+    )
+    
+    if 'Q' in constraints:
+        f, D = constraints['Q']
+        q = Q.reshape((Q.shape[0], Q.shape[1] ** 2))
+        q = np.linalg.inv(Q.shape[0] * D.T @ D) @ (q @ D).sum(axis=0)
+        q = f + D @ q
+        Q = q.reshape(Q.shape[1:])
+    else:
+        Q = Q.mean(axis=0)
+
+    return Q
+
+def kf_em_C(params, y, em_params, constraints={}):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+    x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = em_params
+
+    if C.ndim > 2:
+        raise ValueError('Cannot optimize C when it is initialized to be time-varying')
+
+    # The constraints are used to fit the exogenous coefficient matrix, this is why
+    # the user can't specify custom constraints here
+    f = np.zeros((C.shape[0] * C.shape[1], 1))
+    D = np.kron(np.eye(C.shape[0]), np.transpose(state_exog, axes=[0, 2, 1]))
+    Dt = np.transpose(D, axes=[0, 2, 1])
+    xxt = np.transpose(xx, axes=[0, 2, 1])
+
+    Qi = np.linalg.inv(Q)
+    C1 = np.linalg.inv((Dt @ Qi @ D).sum(axis=0))
+    C2 = (Dt @ Qi @ (x - np.kron(np.eye(Q.shape[0]), xxt) @ np.expand_dims(Phi.flatten(), [1]) - f)).sum(axis=0)
+    c = C1 @ C2
+    C = c.reshape(C.shape)
+    return C
+
+def kf_em_x0(params, y, em_params, constraints={}):
+    x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = em_params 
+    return x0_
+
+def kf_em_E0(params, y, em_params, constraints={}):
+    x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = em_params 
+    return E0_
+
+def kf_em_A(params, y, em_params, constraints={}):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+    x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = em_params
+
+    if A.ndim > 2:
+        raise ValueError('Cannot optimize A when it is initialized to be time-varying')
+
+    xt = np.transpose(x, axes=[0, 2, 1])
+
+    if 'A' in constraints:
+        Ri = np.linalg.inv(R)
+
+        f, D = constraints['A']
+
+        # This is the reverse of the argument order used in the paper, but
+        # passing them the other way doesn't seem to work.
+        rk = np.kron(Ri, pt + x @ xt)
+        
+        A1 = Ri @ (y @ xt)
+        A1 = A1.reshape((A1.shape[0], R.shape[0] * Q.shape[0]))
+        A1 -= rk @ f
+        A1 -= (Ri @ ya @ xt).reshape(A1.shape)
+        A1 = A1 @ D
+
+        A2 = D.T @ rk @ D
+        a = np.linalg.inv(A2.sum(axis=0)) @ A1.sum(axis=0)
+        A = (f + D @ a).reshape(A.shape)
+    else:
+        A1 = (y @ xt - ya @ xt).sum(axis=0)
+        A2 = np.linalg.inv((pt + x @ xt).sum(axis=0))
+        A = A1 @ A2
+
+    return A
+
+def kf_em_U(params, y, em_params, constraints={}):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+    x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = em_params
+
+
+    if U.ndim > 2:
+        raise ValueError('Cannot optimize U when it is initialized to be time-varying')
+
+    f = np.zeros((U.shape[0] * U.shape[1], 1))
+    D = np.kron(np.eye(U.shape[0]), np.transpose(obs_exog, axes=[0, 2, 1]))
+    Dt = np.transpose(D, axes=[0, 2, 1])
+    
+    Ri = np.linalg.inv(R)
+    U1 = np.linalg.inv((Dt @ Ri @ D).sum(axis=0))
+    U2 = (Dt @ Ri @ (y - A @ x - f)).sum(axis=0)
+    u = U1 @ U2
+    U = u.reshape(U.shape)
+
+    return U
+
+def kf_em_R(params, y, em_params, constraints={}):
+    Phi, A, C, Q, R, U, x0, E0, state_exog, obs_exog = params
+    x, xx, pt, ptt1, s11, s10, s00, e, xa, ya, x0_, E0_ = em_params
+
+    if R.ndim > 2:
+        raise ValueError('Cannot optimize R when it is initialized to be time-varying')
+
+    resid = (e @ np.transpose(e, axes=[0, 2, 1]))
+    
+    if A.ndim == 2:
+        va = (A @ pt @ A.T)
+    else:
+        va = (A @ pt @ np.transpose(A, axes=[0, 2, 1]))
+
+    R = (resid + va)
+    
+    if 'R' in constraints:
+        f, D = constraints['R']
+        r = R.reshape((R.shape[0], R.shape[1] ** 2))
+        r = np.linalg.inv(R.shape[0] * D.T @ D) @ (r @ D).sum(axis=0)
+        r = f + D @ r
+        R = r.reshape(R.shape[1:])
+    else:
+        R = R.mean(axis=0)
+
+    return R
+
+def kf_default_state_exog(y):
+    return np.ones((y.shape[0], 1, 1))
+
+def kf_default_obs_exog(y):
+    return np.ones((y.shape[0], 1, 1))
