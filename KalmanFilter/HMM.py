@@ -1,8 +1,9 @@
 import numpy as np
 import scipy as sp
 from . import util
+import scipy.stats
 # from hmmlearn.hmm import GaussianHMM as hl_GaussianHMM
-from .KalmanFilter import KalmanFilter
+from .KalmanFilter import *
 
 # def cloneHmmLearn(gh):
 #     model = hl_GaussianHMM(n_components=gh.Phi.shape[0], covariance_type='diag')
@@ -11,465 +12,612 @@ from .KalmanFilter import KalmanFilter
 #     model.means_ = np.expand_dims(np.array([x.mean() for x in gh.dists]), [1])
 #     model.covars_ = np.expand_dims(np.array([x.var() for x in gh.dists]), [1])
 #     return model
+#     
 
 class HMM:
-	def __init__(self, Phi, dists, pi=None):
-		self.dists = dists
-		# self.dists = [sp.stats.poisson(mu) for mu in state_params]
-		# self.state_params = state_params
-		self.Phi = Phi
-		self.pi = util.solve_stationary(Phi.T) if type(pi) == type(None) else pi
-		self.state_dim = self.Phi.shape[0]
+    def __init__(self, P, dists, pi=None):
+        self.dists = dists
+        # self.dists = [sp.stats.poisson(mu) for mu in state_params]
+        # self.state_params = state_params
+        self.P = P
+        self.pi = util.solve_stationary(P.T) if type(pi) == type(None) else pi
+        self.state_dim = self.P.shape[0]
 
-	def filter(self, y):
-		# My textbook and other implementations seem to set ptt1 = self.pi rather than pt,
-		# but the EM algorithm decreases in likelihood occasionally when I do it that way, and
-		# this way it does not. It also seems more logical this way to me.
-		pt = self.pi
-		pred = []
-		filtered = []
+    def hmm_params(self):
+        return self.P, self.pi
 
-		py = self.pdf(y).T
+    def filter_once(self, ptt1, py):
+        P, pi = self.hmm_params()
+        pt = (py * ptt1) / (py @ ptt1)
+        ptt1 = P @ pt 
+        return pt, ptt1
 
-		for i,v in enumerate(y):
-			ptt1 = pt @ self.Phi
-			pt = (py[i] * ptt1) / (py[i] @ ptt1)
-			
-			pred.append(ptt1)
-			filtered.append(pt)
+    def filter(self, y):
+        # My textbook and other implementations seem to set ptt1 = self.pi rather than pt,
+        # but the EM algorithm decreases in likelihood occasionally when I do it that way, and
+        # this way it does not. It also seems more logical this way to me.
+        pt = self.pi
+        ptt1 = self.P @ pt
+        pred = []
+        filtered = []
+        py = self.pdf(y)
 
-		return np.array(pred), np.array(filtered), py
+        for i,v in enumerate(y):
+            pred.append(ptt1)
+            pt, ptt1 = self.filter_once(ptt1, py[i])
+            filtered.append(pt)
 
-	def filter_states(self, y, **kwargs):
-		pt = self.pi
-		pred = []
-		filtered = []
+        return np.array(pred), np.array(filtered), py
 
-		state = None
-		pys = []
-		xtts = []
-		Ptts = []
-		Ks = []
+    def pdf(self, val, pt=None, state=None):
+        result = []
 
-		for i,v in enumerate(y):
-			ptt1 = pt @ self.Phi
-			pt, py, state = self.pdf_once(i, v, pt=ptt1, state=state, **kwargs)
-			xtt, Ptt, K = state
+        for d in self.dists:
+            if isinstance(d.dist, sp.stats.rv_continuous):
+                v = d.pdf(val)
+                
+                # Temporary hack, fix later
+                if v.ndim == 1 and v.shape[0] == 1:
+                    v = v[0]
 
-			pred.append(ptt1)
-			filtered.append(pt)
-			pys.append(py)
-			xtts.append(xtt)
-			Ptts.append(Ptt)
-			Ks.append(K)
+                result.append(v)
+            else:
+                result.append(d.pmf(val))
 
-		py = np.array(pys)
-		xtts = np.array(xtts)
-		Ptts = np.array(Ptts)
-		Ks = np.array(Ks)
+        return np.array(result).T
 
-		return np.array(pred), np.array(filtered), py, xtts, Ptts, Ks
+    def smooth_once(self, p, pt, py):
+        P, pi = self.hmm_params()
 
-	def filter_once(self, pt, py):
-		ptt1 = pt @ self.Phi
-		return (py * ptt1) / (py @ ptt1)
+        # We only care about using the relative weights of p, and if we alllow it to recursively
+        # multiply backwards, it just keeps shrinking in scale. So just periodically rescale it.
+        if p.min() < 1e-15 or p.max() > 1e15:
+            p = p / p.sum()
 
-	def pdf(self, val, pt=None, state=None):
-		result = []
+        prevp = p
+        p = P @ (py * p)
+        pnt = (pt * p) / (pt @ p)
+        pxn = (pnt * (P * py * prevp).T / p).T
 
-		for d in self.dists:
-			if isinstance(d.dist, sp.stats.rv_continuous):
-				v = d.pdf(val)
-				
-				# Temporary hack, fix later
-				if v.ndim == 1 and v.shape[0] == 1:
-					v = v[0]
+        return p, pnt, pxn
 
-				result.append(v)
-			else:
-				result.append(d.pmf(val))
+    def smooth_init_pxn(self, pnt):
+        return (pnt * self.P.T).T
 
-		return np.array(result)
+    def smooth(self, y):
+        ptp, ptf, py = self.filter(y)
+        states = [ptf[-1]]
+        p = np.ones(self.pi.shape)
+        pxns = [self.smooth_init_pxn(ptf[-1])]
 
-	def smooth(self, y):
-		ptp, ptf, py = self.filter(y)
-		pnt = ptf[-1]
-		states = [pnt]
-		p = np.ones(self.pi.shape)
-		pxns = []
+        for i in range(1, len(y)):
+            p, pnt, pxn = self.smooth_once(p, ptf[-(i+1)], py[-i])
+            states.append(pnt)
+            pxns.append(pxn)
 
-		for i,v in enumerate(reversed(y[:-1])):
-			# We only care about using the relative weights of p, and if we alllow it to recursively
-			# multiply backwards, it just keeps shrinking in scale. So just periodically rescale it.
-			if p.min() < 1e-15 or p.max() > 1e15:
-				prevp = prevp / prevp.sum()
-				p = p / p.sum()
+        _, pn0, _ = self.smooth_once(p, self.pi, py[0])
 
-			prevp = p
-			pyv = py[-(i + 1)]
-			p = self.Phi @ (pyv * p)
+        states = list(reversed(states))
+        pxns = list(reversed(pxns))
 
-			ptt = ptf[-(i + 2)]
-			pnt = (ptt * p) / (ptt @ p)
-			pxn = (pnt * (self.Phi * pyv * prevp).T / p).T
-			
-			states.append(pnt)
-			pxns.append(pxn)
+        return np.array(states), np.array(pxns), pn0
 
-		prevp = p
-		p = self.Phi @ (py[0] * p)
-		pn0 = (self.pi * p) / (self.pi @ p)
+    def sample(self, n):
+        svals = np.random.uniform(0, 1, size=n)
+        st = np.where(svals[0] <= self.pi.cumsum())[0][0]
+        states = [st]
+        vals = [self.dists[st].rvs(1)[0]]
 
-		states = list(reversed(states))
-		pxns = list(reversed(pxns))
+        for sv in svals[1:]:
+            st = np.where(sv <= self.P[st].cumsum())[0][0]
+            states.append(st)
+            vals.append(self.dists[st].rvs(1)[0])
 
-		return np.array(states), np.array(pxns), pn0
+        return np.array(states), np.array(vals)
 
-	def sample(self, n):
-		svals = np.random.uniform(0, 1, size=n)
-		st = np.where(svals[0] <= self.pi.cumsum())[0][0]
-		states = [st]
-		vals = [self.dists[st].rvs(1)[0]]
+    def log_likelihood(self, y):
+        ptp, ptf, py = self.filter(y)
+        dv = (ptp * py).sum(axis=1) # Probability weighted sum of the masses
+        return np.log(dv).sum()
 
-		for sv in svals[1:]:
-			st = np.where(sv <= self.Phi[st].cumsum())[0][0]
-			states.append(st)
-			vals.append(self.dists[st].rvs(1)[0])
+    def minimize(self, y, method='BFGS'):
+        params = np.concatenate((
+            self.pi,
+            self.P.flatten(),
+            *[d.params() for d in self.dists]
+        ))
 
-		return np.array(states), np.array(vals)
+        i = 0
+        def hmm_ll(params):
+            nonlocal i
 
-	def log_likelihood(self, y):
-		ptp, ptf, py, xtts = self.filter(y)
-		dv = (ptp * py).sum(axis=1) # Probability weighted sum of the masses
-		return np.log(dv).sum()
+            ll = create_hmm(params, self.pi.size, self.__class__).log_likelihood(y)
 
-	def minimize(self, y, method='BFGS'):
-		params = np.concatenate((
-			self.pi,
-			self.Phi.flatten(),
-			*[d.params() for d in self.dists]
-		))
+            i += 1
+            if i % 100 == 0:
+                print('\t[{}] {:.2f}'.format(i, ll))
 
-		i = 0
-		def hmm_ll(params):
-			nonlocal i
+            return -ll
 
-			ll = create_hmm(params, self.pi.size, self.__class__).log_likelihood(y)
+        print('Starting likelihood: {:.2f} ({:.2f})'.format(self.log_likelihood(y), hmm_ll(params)))
+        r = sp.optimize.minimize(
+            hmm_ll,
+            params,
+            method=method
+        )
 
-			i += 1
-			if i % 100 == 0:
-				print('\t[{}] {:.2f}'.format(i, ll))
+        hmm = create_hmm(r.x, self.pi.size, self.__class__)
 
-			return -ll
-
-		print('Starting likelihood: {:.2f} ({:.2f})'.format(self.log_likelihood(y), hmm_ll(params)))
-		r = sp.optimize.minimize(
-			hmm_ll,
-			params,
-			method=method
-		)
-
-		hmm = create_hmm(r.x, self.pi.size, self.__class__)
-
-		self.pi = hmm.pi
-		self.Phi = hmm.Phi
-		self.dists = hmm.dists
-		print('Minimized: {:.2f}'.format(self.log_likelihood(y)))
+        self.pi = hmm.pi
+        self.P = hmm.P
+        self.dists = hmm.dists
+        print('Minimized: {:.2f}'.format(self.log_likelihood(y)))
 
 
-	def em_distributions(self, st, pxns, y):
-		# This is to be overriden by distributional specific child classes
-		pass
+    def em_distributions(self, st, pxns, y):
+        # This is to be overriden by distributional specific child classes
+        pass
 
-	def em(self, y, n=10, strict=False):
-		print('Starting likelihood: {:.2f}'.format(self.log_likelihood(y)))
+    def em(self, y, n=10, strict=False):
+        # Note: Estimating the C parameter can lead to instability, due to its feedback effects
+        # on probability estimation. That is, the state intercept can influence what the HMM
+        # believes the states are, which causes the filtering approximation for the probabilities
+        # to become insufficient.
+        print('Starting likelihood: {:.2f}'.format(self.log_likelihood(y)))
 
-		prev_ll = -np.inf
-		for i in range(n):
-			self.em_iter(y, strict=strict)
+        prev_ll = -np.inf
+        for i in range(n):
+            self.em_once(y, strict=strict, constraints=self.constraints)
 
-			ll = self.log_likelihood(y)
-			print('\t[{}] ll: {:.2f}'.format(i, ll))
-			
-			if prev_ll - ll > 0.01:
-				print('Error likelihood decreased in EM iteration: {:.4f} -> {:.4f}'.format(prev_ll, ll))
-				raise ValueError('Error likelihood decreased')
+            ll = self.log_likelihood(y)
+            print('\t[{}] ll: {:.2f}'.format(i, ll))
+            
+            if prev_ll - ll > 0.01:
+                print('Error likelihood decreased in EM iteration: {:.4f} -> {:.4f}'.format(prev_ll, ll))
+                raise ValueError('Error likelihood decreased')
 
-			prev_ll = ll
+            prev_ll = ll
 
-	def em_iter(self, y, exclude_dists=False, strict=False, em_vars=['pi', 'Phi']):
-		cached = None
-		prev_ll = -np.inf
+    def em_pi(self, em_params):
+        st, pxns, p0 = em_params
+        return p0
 
-		def smooth(name):
-			nonlocal cached, prev_ll
-			
-			if cached == None or strict == True:
-				cached = self.smooth(y)
+    def em_P(self, em_params):
+        st, pxns, p0 = em_params
+        return (pxns.sum(0).T / pxns.sum(2).sum(0)).T
 
-			if strict == True:
-				ll = self.log_likelihood(y)
-				
-				if prev_ll - ll > 0.01:
-					old = self.Phi
-					self.Phi = (self.Phi.T / self.Phi.sum(1)).T
-					pll = self.log_likelihood(y)
-					self.Phi = old
-					print('Likelihood decreased before optimizing {}: {:.4f} -> {:.4f} ({:.4f})'.format(name, prev_ll, ll, pll))
-					# raise ValueError('test')
+    def em_once(self, y, exclude_dists=False, strict=False, em_vars=['pi', 'P']):
+        cached = None
+        prev_ll = -np.inf
 
-				prev_ll = ll
+        def smooth(name):
+            nonlocal cached, prev_ll
+            
+            if cached == None or strict == True:
+                cached = self.smooth(y)
 
-			return cached
+            if strict == True:
+                ll = self.log_likelihood(y)
+                
+                if prev_ll - ll > 0.01:
+                    print('Likelihood decreased before optimizing {}: {:.4f} -> {:.4f} ({:.4f})'.format(name, prev_ll, ll))
 
-		if 'pi' in em_vars:
-			st, pxns, p0 = smooth('pi')
-			self.pi = p0
+                prev_ll = ll
 
-		if 'Phi' in em_vars:
-			st, pxns, p0 = smooth('Phi')
-			self.Phi = (pxns.sum(0).T / pxns.sum(2).sum(0)).T
+            return cached
 
-		if exclude_dists == False:
-			st, pxns, p0 = smooth('Dists')
-			self.dists = self.em_distributions(st, pxns, y)
-			smooth('End')
+        if 'pi' in em_vars:
+            self.pi = self.em_pi(smooth('pi'))
+
+        if 'P' in em_vars:
+            self.P = self.em_P(smooth('P'))
+
+        if exclude_dists == False:
+            st, pxns, p0 = smooth('Dists')
+            self.dists = self.em_distributions(st, pxns, y)
 
 
 class Poisson(sp.stats.rv_discrete):
-	def __init__(self, lam):
-		self.lam = lam
-		self.dist = self
+    def __init__(self, lam):
+        self.lam = lam
+        self.dist = self
 
-	def params(self):
-		return np.array([self.mean()])
+    def params(self):
+        return np.array([self.mean()])
 
-	def mean(self):
-		return self.lam
+    def mean(self):
+        return self.lam
 
-	def var(self):
-		return self.lam
+    def var(self):
+        return self.lam
 
-	def log_pmf(self, k):
-		return sp.special.xlogy(k, self.lam) - (self.lam + sp.special.gammaln(k + 1))
-	
-	def pmf(self, k):
-		return np.exp(self.log_pmf(k))
+    def log_pmf(self, k):
+        return sp.special.xlogy(k, self.lam) - (self.lam + sp.special.gammaln(k + 1))
+    
+    def pmf(self, k):
+        return np.exp(self.log_pmf(k))
 
 
 class Normal(sp.stats.rv_continuous):
-	def __init__(self, mu, s2):
-		self.mu = mu
-		self.s2 = s2
-		self.dist = self
+    def __init__(self, mu, s2):
+        self.mu = mu
+        self.s2 = s2
+        self.dist = self
 
-	def params(self):
-		return np.array([self.mean(), self.var()])
+    def params(self):
+        return np.array([self.mean(), self.var()])
 
-	def mean(self):
-		return self.mu
+    def mean(self):
+        return self.mu
 
-	def var(self):
-		return self.s2
+    def var(self):
+        return self.s2
 
-	def std(self):
-		return self.s2 ** 0.5
+    def std(self):
+        return self.s2 ** 0.5
 
-	def pdf(self, x):
-		return util.normal_density(x, self.mu, self.s2)
+    def pdf(self, x):
+        return util.normal_density(x, self.mu, self.s2)
 
 class PoissonHMM(HMM):
-	dist = Poisson
+    dist = Poisson
 
-	def __init__(self, Phi, means, **kwargs):
-		HMM.__init__(self, Phi, self.create_dists(means), **kwargs)
-	
-	@staticmethod
-	def from_flat(Phi, means, **kwargs):
-		return PoissonHMM(Phi, means, **kwargs)
+    def __init__(self, P, means, **kwargs):
+        HMM.__init__(self, P, self.create_dists(means), **kwargs)
+    
+    @staticmethod
+    def from_flat(P, means, **kwargs):
+        return PoissonHMM(P, means, **kwargs)
 
-	def create_dists(self, means):
-		return [
-			Poisson(m) for m in means
-		]
+    def create_dists(self, means):
+        return [
+            Poisson(m) for m in means
+        ]
 
-	def em_distributions(self, st, pxns, y):
-		means = (y @ st) / st.sum(0)
-		return self.create_dists(means)
+    def em_distributions(self, st, pxns, y):
+        means = (y @ st) / st.sum(0)
+        return self.create_dists(means)
 
 class GaussianHMM(HMM):
-	dist = Normal
+    dist = Normal
 
-	def __init__(self, Phi, means, s2, **kwargs):
-		HMM.__init__(self, Phi, self.create_dists(means, s2), **kwargs)
+    def __init__(self, P, means, s2, **kwargs):
+        HMM.__init__(self, P, self.create_dists(means, s2), **kwargs)
 
-	@staticmethod
-	def from_flat(pi, Phi, params, **kwargs):
-		n = params.size // 2
-		means = [params[i*2] for i in range(n)]
-		s2 = [params[i*2+1] for i in range(n)]
-		return GaussianHMM(Phi, means, s2, **kwargs)
+    @staticmethod
+    def from_flat(pi, P, params, **kwargs):
+        n = params.size // 2
+        means = [params[i*2] for i in range(n)]
+        s2 = [params[i*2+1] for i in range(n)]
+        return GaussianHMM(P, means, s2, **kwargs)
 
-	def create_dists(self, means, s2):
-		return [
-			Normal(means[i], s2[i]) for i in range(len(means))
-		]
+    def create_dists(self, means, s2):
+        return [
+            Normal(means[i], s2[i]) for i in range(len(means))
+        ]
 
-	def em_distributions(self, st, pxns, y):
-		sts = st.sum(axis=0)
-		means = (y @ st) / sts
-		s2 = ((y ** 2 @ st) / sts) - (means ** 2)
-		return self.create_dists(means, s2)
+    def em_distributions(self, st, pxns, y):
+        sts = st.sum(axis=0)
+        means = (y @ st) / sts
+        s2 = ((y ** 2 @ st) / sts) - (means ** 2)
+        return self.create_dists(means, s2)
 
 class GaussianAR(sp.stats.rv_continuous):
-	def __init__(self, alpha, betas, s2):
-		self.alpha = alpha
-		self.betas = np.array(betas)
-		self.s2 = s2
-		self.dist = self
+    def __init__(self, alpha, betas, s2):
+        self.alpha = alpha
+        self.betas = np.array(betas)
+        self.s2 = s2
+        self.dist = self
 
-	def params(self):
-		return np.array([self.alpha, *self.betas, self.s2])
+    def params(self):
+        return np.array([self.alpha, *self.betas, self.s2])
 
-	def mean(self):
-		return np.nan
+    def mean(self):
+        return np.nan
 
-	def var(self):
-		return self.s2
+    def var(self):
+        return self.s2
 
-	def std(self):
-		return self.var() ** 0.5
+    def std(self):
+        return self.var() ** 0.5
 
-	def pdf(self, x):
-		n = len(self.betas)
-		xr = np.lib.stride_tricks.sliding_window_view(x, n, axis=0)[:-1]
-		mus = self.alpha + xr @ self.betas
-		# The sliding window will chop off the first len(self.betas) - 1 elements, so fill
-		# in all these with alpha
-		first_mus = np.full(len(self.betas), self.alpha)
-		mus = np.concatenate((first_mus, mus))
-		e = (x - mus) ** 2 / (2 * self.s2)
-		return np.exp(-e) / np.sqrt(2 * np.pi * self.s2)
+    def pdf(self, x):
+        n = len(self.betas)
+        xr = np.lib.stride_tricks.sliding_window_view(x, n, axis=0)[:-1]
+        mus = self.alpha + xr @ self.betas
+        # The sliding window will chop off the first len(self.betas) - 1 elements, so fill
+        # in all these with alpha
+        first_mus = np.full(len(self.betas), self.alpha)
+        mus = np.concatenate((first_mus, mus))
+        e = (x - mus) ** 2 / (2 * self.s2)
+        return np.exp(-e) / np.sqrt(2 * np.pi * self.s2)
 
 class GaussianArHMM(HMM):
-	dist = GaussianAR
+    dist = GaussianAR
 
-	def __init__(self, Phi, alphas, betas, s2, **kwargs):
-		HMM.__init__(self, Phi, self.create_dists(alphas, betas, s2), **kwargs)
+    def __init__(self, P, alphas, betas, s2, **kwargs):
+        HMM.__init__(self, P, self.create_dists(alphas, betas, s2), **kwargs)
 
-	def create_dists(self, alphas, betas, s2):
-		return [
-			GaussianAR(alphas[i], betas[i], s2[i]) for i in range(len(alphas))
-		]
+    def create_dists(self, alphas, betas, s2):
+        return [
+            GaussianAR(alphas[i], betas[i], s2[i]) for i in range(len(alphas))
+        ]
 
-	def em_distributions(self, st, pxns, y):
-		alphas = []
-		betas = []
-		s2s = []
+    def em_distributions(self, st, pxns, y):
+        alphas = []
+        betas = []
+        s2s = []
 
-		for i in range(st.shape[1]):
-			n = len(self.dists[i].betas)
-			w = st[:,i][n:]
-			X = np.lib.stride_tricks.sliding_window_view(y, n, axis=0)[:-1]
-			X = np.hstack((X, np.expand_dims(np.ones(X.shape[0]), [1])))
-			# Compute a weighted least squares regression, using the state probabilities
-			# as weights, and adding an intercept
-			# p = np.linalg.inv(X.T @ W @ X) @ X.T @ W @ y[n:]
-			p = np.linalg.pinv(X * w[:, None]) @ (y[n:] * w)
-			beta, alpha = p[:-1], p[-1]
-			alphas.append(alpha)
-			betas.append(beta)
+        for i in range(st.shape[1]):
+            n = len(self.dists[i].betas)
+            w = st[:,i][n:]
+            X = np.lib.stride_tricks.sliding_window_view(y, n, axis=0)[:-1]
+            X = np.hstack((X, np.expand_dims(np.ones(X.shape[0]), [1])))
+            # Compute a weighted least squares regression, using the state probabilities
+            # as weights, and adding an intercept
+            # p = np.linalg.inv(X.T @ W @ X) @ X.T @ W @ y[n:]
+            p = np.linalg.pinv(X * w[:, None]) @ (y[n:] * w)
+            beta, alpha = p[:-1], p[-1]
+            alphas.append(alpha)
+            betas.append(beta)
 
-			# Compute the conditional means using our new alphas and betas
-			means = X @ p
-			resid = y[n:] - means
-			s2 = ((resid ** 2) * w).sum() / w.sum()
-			s2s.append(s2)
+            # Compute the conditional means using our new alphas and betas
+            means = X @ p
+            resid = y[n:] - means
+            s2 = ((resid ** 2) * w).sum() / w.sum()
+            s2s.append(s2)
 
-		return self.create_dists(alphas, betas, s2s)
+        # alphas = [x.alpha for x in self.dists]
+        # s2s = [x.s2 for x in self.dists]
+        return self.create_dists(alphas, betas, s2s)
 
-class KalmanDist(HMM):
-	def __init__(self, *args, **kwargs):
-		self.kf = KalmanFilter(*args, **kwargs)
+class KalmanMeasurementHMM(KalmanFilter, HMM):
+    def __init__(self, y, P, *args, pi=None, **kwargs):
+        A = kwargs['A']
+        kwargs['A'] = A[0]
+        KalmanFilter.__init__(self, y, **kwargs)
+        HMM.__init__(self, P, None, pi=pi)
+        self.A = A
 
-	def params(self):
-		return self.kf.params()
+    def hmm_params(self):
+        return self.P, self.pi
 
-	def mean(self):
-		return np.nan
+    def filter(self, pmin=1e-16):
+        Phi, A, C, Q, R, U, x0, E0, G, H, F, state_exog, obs_exog = self.params()
 
-	def var(self):
-		return np.nan
+        xp = []
+        xf = []
+        ptf = []
+        ptp = []
+        ks = []
 
-	def std(self):
-		return self.var() ** 0.5
+        # Pre-compute the state and obs intercepts for the whole series
+        xa = self.state_intercept()
+        ya = self.obs_intercept()
+        xtt = x0
+        Ptt = self.F @ E0 @ self.F.T
 
-	def pdf(self, x):
-		pass
+        pt = self.pi
+        ptt1 = self.P @ pt
+        pts = []
+        pys = []
+        # fses = []
+        for i,v in enumerate(self.y):
+            xtt1, Ptt1 = self.predict_once(i, xtt, Ptt, xa[i], A=self.A[0])
 
-class KalmanHMM(HMM):
-	dist = KalmanDist
+            pyv = [self.likelihood_once(i, xtt1, Ptt1, v, ya=ya[j], A=A[j]) for j in range(self.A.shape[0])]
+            pyv = np.squeeze(np.array(pyv))
+            pyv[pyv < pmin] = pmin
 
-	def __init__(self, Phi, kfs, **kwargs):
-		self.kfs = kfs
-		HMM.__init__(self, Phi, kfs, **kwargs)
+            pt, ptt1 = HMM.filter_once(self, ptt1, pyv)
 
-	def pdf_once(self, i, y, pt, state, state_exog=None, obs_exog=None):
-		if state is not None:
-			xtt, Ptt, K = state
-		else:
-			xtt = None
-			Ptt = None
+            # Compute the probability weighted average measurement matrix
+            pte = np.expand_dims(pt, [1, 2])
+            A_avg = (pte * self.A).sum(0)
 
-		xtts = []
-		Ptts = []
-		Ks = []
-		pys = []
+            # Filter the next state using the probability weighted average measurement
+            # matrix
+            xtts = []
+            Ptts = []
+            Ks = []
 
-		y = y if type(y) == np.ndarray else np.array([y])
+            fs = [self.filter_once(i, xtt1, Ptt1, v, ya[i], A=self.A[i]) for i in range(self.A.shape[0])]
+            # Invert the list, so that it's aggregated type-wise (i.e. xtts with xtts, Ptts with Ptts, etc)
+            # fses.append(fs)
+            fs = zip(*fs)
+            xtt, Ptt, K = [(pte * f).sum(0) for f in fs]
 
-		for kf in self.kfs:
-			xa = kf.C if state_exog is None else kf.C @ state_exog[i]
-			ya = kf.U if obs_exog is None else kf.U @ obs_exog[i]
+            xp.append(xtt1)
+            xf.append(xtt)
+            ptp.append(Ptt1)
+            ptf.append(Ptt)
+            ks.append(K)
+            pts.append(pt)
+            pys.append(pyv)
 
-			pxtt1, pxtt, pPtt1, pPtt, pK = kf.filter_once(i, xtt, Ptt, y, xa, ya)
-			py = kf.likelihood_once(i, pxtt1, pPtt1, y, ya)
+        return (
+            np.array(xp),
+            np.array(ptp),
+            np.array(xf),
+            np.array(ptf),
+            np.array(ks),
+            np.array(pts),
+            np.array(pys),
+            # fses
+        )  
 
-			pys.append(py)
-			xtts.append(pxtt)
-			Ptts.append(pPtt)
-			Ks.append(pK)
+    def log_likelihoods(self, **kwargs):
+        *filter_params, pt, pys = self.filter()
+        lls = [
+            self._log_likelihoods(
+                filter_params, 
+                A=self.A[i],
+                **kwargs
+            ) for i in range(self.A.shape[0])
+        ]
+        self.lls = lls
+        lls = np.hstack(lls)
+        return (pt * lls).sum(1)
 
-		xtts = np.array(xtts)
-		Ptts = np.array(Ptts)
-		Ks = np.array(Ks)
-		pys = np.array(pys)
+    def em_params(self, **kwargs):
+        *smooth_params, pts, pys, pxns = self.smooth(**kwargs)
 
-		oxtt = xtt
+        emps = [
+            self._em_params(smooth_params, A=self.A[i])
+            for i in range(self.A.shape[0])
+        ]
 
-		py = np.squeeze(pys)
-		pt = (py * pt) / (py @ pt)
-		pte = np.expand_dims(pt, [1, 2])
-		xtt = (xtts * pte).sum(0)
-		Ptt = (Ptts * pte).sum(0)
-		K = (Ks * pte).sum(0)
+        emps = zip(*emps)
+        pte = np.expand_dims(pts, [2])
+        pte = np.swapaxes(pte, 0, 1)
 
-		return pt, py, (xtt, Ptt, K)
+        result = []
+        
+        for v in emps:
+            v = np.array(v)
+            if v.ndim == 4:
+                v = (pte[:,:,None] * v).sum(0)
+            elif v.ndim == 3 and v.shape[1] == pte.shape[1]:
+                v = (pte * v).sum(0)
+            else:
+                # These are, e.g. the x0 and E0 parameters
+                v = v[0]
+
+            result.append(v)
+
+        return tuple(result)
+
+    def em_A(self, *args, **kwargs):
+        raise ValueError('[KalmanMeasurementHMM] Cannot optimize the measurement matrix (A) in a measurement HMM')
+
+    def em_once(self, *args, em_vars=['P', 'Phi', 'Q', 'C', 'R', 'U', 'x0', 'E0'], strict=False, starting_likelihood=None, **kwargs):
+        cached = None
+
+        def smooth():
+            nonlocal cached
+            if cached is None or strict == True:
+                cached = self.smooth()
+            return cached
+
+        smooth_params = None
+        nll = None
+        # if 'pi' in em_vars:
+        #     *smooth_params, pts, pys = smooth()
+        #     p0 = pts[0]
+        #     self.pi = self.em_pi((pts, pys, p0))
+
+        if 'P' in em_vars:
+            ll = None
+            if self.log_level == 'debug':
+                ll = self.log_likelihood()
+
+            *smooth_params, pts, pys, pxns = smooth()
+            p0 = pts[0]
+            self.P = self.em_P((pts, pxns, p0))
+
+            if self.log_level == 'debug':
+                nll = self.log_likelihood()
+                print('\tP: {:.2f}'.format(nll))
+                if ll > nll:
+                    print('[KalmanMeasurementHMM] Likelihood decreased optimizing P: {:.4f} -> {:.4f}'.format(ll, nll))
+
+                starting_likelihood = nll
+
+        # Remove the default inclusion of the measurement matrix as a parameter to be optimized
+        return KalmanFilter.em_once(self, *args, **kwargs, em_vars=em_vars, strict=strict, starting_likelihood=starting_likelihood)
+
+    def smooth_cov_init(self, pt, K, Pn1):
+        covs = [KalmanFilter.smooth_cov_init(self, K, Pn1, A=self.A[i]) for i in range(self.A.shape[0])]
+        covs = np.array(covs)
+        pt = np.expand_dims(pt, [1, 2])
+        return (pt * covs).sum(0)
+
+    def smooth(self, filter_params=None):
+        # The smoother is too computationally intensive, so just use the filter as an approximation
+        *filter_params, pts, pys = self.filter() if filter_params is None else filter_params
+        pxns = [np.outer(pts[i], pts[i+1]) for i in range(pts.shape[0] - 1)]
+        pxns.append(self.smooth_init_pxn(pts[-1]))
+        pxns = np.array(pxns)
+
+        cov_init = self.smooth_cov_init(pts[-1], filter_params[-1][-1], filter_params[-2][-2])
+        return *self._smooth(filter_params, A=self.A[0], cov_init=cov_init), pts, pys, pxns
+
+    def named_params(self):
+        p = KalmanFilter.named_params(self)
+        p['P'] = self.P
+        p['pi'] = self.pi
+        return p
+
+    # @classmethod
+    # def unflatten_params(cls, params, state_dim, state_exog_dim, obs_dim, obs_exog_dim, args, constraints, i=0):
+    #     hmm_states = len(args['A'])
+
+    #     if 'pi' in args:
+    #         pi = args['pi']
+    #     else:
+    #         pi, i = cls.extract_parameter(i, params, (hmm_states, 1), None)
+
+    #     if 'P' in args:
+    #         P = args['P']
+    #         P, i = cls.extract_parameter(i, params, (hmm_states, hmm_states), None)
+
+    #     if 'A' not in args:
+    #         args['A'], i = cls.extract_parameter(i, params, (hmm_states, obs_dim, state_dim), constraints['A'] if 'A' in constraints else None)
+
+    #     return KalmanFilter.unflatten_params(params, state_dim, state_exog_dim, obs_dim, obs_exog_dim, args, constraints, i=i)
+        
+
+def kf_hmm_expected(params, pt, fn):
+    vals = kf_hmm_eval(params, fn)
+
+    # If pt's ndim is 1, then we're dealing with a single state tuple and we want to average it. If pt's ndim is 2
+    # then we're dealing with a vector of state tuples, and we want to average over each
+    # of the state tuples.
+    sum_axis = 0 if pt.ndim == 1 else 1
+    pt = np.expand_dims(pt, [1, 2]) if pt.ndim == 1 else np.expand_dims(pt, [2])
+
+    if type(vals[0]) == tuple:
+        # Invert the pairings, so we're now grouping by type
+        # rather than state
+        vals = list(zip(*vals))
+        res = []
+        
+        for v in vals:
+            v = np.hstack(v)
+            v = (pt * v).sum(sum_axis)
+            v = np.expand_dims(v, [2])
+            res.append(v)
+
+        return tuple(res)
+    else:
+        vals = np.array(vals)
+        return (pt * vals).sum(sum_axis)
+
+
+def kf_hmm_em_params(pt, params, y):
+    filter_params = kf_filter(params, y)
+    smooth_params = kf_smooth(params, filter_params)
+    return kf_hmm_expected(params, lambda st_params: kf_em_params_(st_params, yz))
+
+def kf_hmm_em_R(pt, params, y, em_params, constraints=()):
+    Rs = kf_hmm_eval(params, lambda st_params: kf_em_R(st_params, y, em_params, constraints=constraints))
+    Rs = np.array(Rs)
+    return (pt * covs).sum()
 
 def create_hmm(params, state_dim, cls):
-	i = 0
-	
-	pi = params[i:i+state_dim]
-	i += state_dim
+    i = 0
+    
+    pi = params[i:i+state_dim]
+    i += state_dim
 
-	ssdim = state_dim ** 2
-	Phi = params[i:i+ssdim].reshape((state_dim, state_dim))
-	i += ssdim
+    ssdim = state_dim ** 2
+    Phi = params[i:i+ssdim].reshape((state_dim, state_dim))
+    i += ssdim
 
-	pi = np.abs(pi)
-	pi /= pi.sum()
+    pi = np.abs(pi)
+    pi /= pi.sum()
 
-	Phi = np.abs(Phi)
-	Phi = (Phi.T / Phi.sum(1)).T
+    Phi = np.abs(Phi)
+    Phi = (Phi.T / Phi.sum(1)).T
 
-	return cls.from_flat(Phi, params[i:], pi=pi)
+    return cls.from_flat(Phi, params[i:], pi=pi)
