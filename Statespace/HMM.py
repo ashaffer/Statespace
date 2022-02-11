@@ -373,18 +373,16 @@ class GaussianArHMM(HMM):
 
 class KalmanMeasurementHMM(KalmanFilter, HMM):
     def __init__(self, y, P, *args, pi=None, **kwargs):
-        A = kwargs['A']
-        kwargs['A'] = A[0]
+        Z = kwargs['Z']
+        kwargs['Z'] = Z[0]
         KalmanFilter.__init__(self, y, **kwargs)
         HMM.__init__(self, P, None, pi=pi)
-        self.A = A
+        self.Z = Z
 
     def hmm_params(self):
         return self.P, self.pi
 
     def filter(self, pmin=1e-16):
-        Phi, A, C, Q, R, U, x0, E0, G, H, F, state_exog, obs_exog = self.params()
-
         xp = []
         xf = []
         ptf = []
@@ -394,18 +392,18 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
         # Pre-compute the state and obs intercepts for the whole series
         xa = self.state_intercept()
         ya = self.obs_intercept()
-        xtt = x0
-        Ptt = self.F @ E0 @ self.F.T
+        xtt = self.x0
+        Ptt = self.F @ self.V0 @ self.F.T
 
         pt = self.pi
         ptt1 = self.P @ pt
         pts = []
         pys = []
-        # fses = []
-        for i,v in enumerate(self.y):
-            xtt1, Ptt1 = self.predict_once(i, xtt, Ptt, xa[i], A=self.A[0])
 
-            pyv = [self.likelihood_once(i, xtt1, Ptt1, v, ya=ya[j], A=A[j]) for j in range(self.A.shape[0])]
+        for i,v in enumerate(self.y):
+            xtt1, Ptt1 = self.predict_once(i, xtt, Ptt, xa[i], Z=self.Z[0])
+
+            pyv = [self.likelihood_once(i, xtt1, Ptt1, v, ya=ya[j], Z=self.Z[j]) for j in range(self.Z.shape[0])]
             pyv = np.squeeze(np.array(pyv))
             pyv[pyv < pmin] = pmin
 
@@ -413,7 +411,7 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
 
             # Compute the probability weighted average measurement matrix
             pte = np.expand_dims(pt, [1, 2])
-            A_avg = (pte * self.A).sum(0)
+            A_avg = (pte * self.Z).sum(0)
 
             # Filter the next state using the probability weighted average measurement
             # matrix
@@ -421,9 +419,8 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
             Ptts = []
             Ks = []
 
-            fs = [self.filter_once(i, xtt1, Ptt1, v, ya[i], A=self.A[i]) for i in range(self.A.shape[0])]
+            fs = [self.filter_once(i, xtt1, Ptt1, v, ya[i], Z=self.Z[i]) for i in range(self.Z.shape[0])]
             # Invert the list, so that it's aggregated type-wise (i.e. xtts with xtts, Ptts with Ptts, etc)
-            # fses.append(fs)
             fs = zip(*fs)
             xtt, Ptt, K = [(pte * f).sum(0) for f in fs]
 
@@ -442,8 +439,7 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
             np.array(ptf),
             np.array(ks),
             np.array(pts),
-            np.array(pys),
-            # fses
+            np.array(pys)
         )  
 
     def log_likelihoods(self, **kwargs):
@@ -451,9 +447,9 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
         lls = [
             self._log_likelihoods(
                 filter_params, 
-                A=self.A[i],
+                Z=self.Z[i],
                 **kwargs
-            ) for i in range(self.A.shape[0])
+            ) for i in range(self.Z.shape[0])
         ]
         self.lls = lls
         lls = np.hstack(lls)
@@ -463,8 +459,8 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
         *smooth_params, pts, pys, pxns = self.smooth(**kwargs)
 
         emps = [
-            self._em_params(smooth_params, A=self.A[i])
-            for i in range(self.A.shape[0])
+            self._em_params(smooth_params, Z=self.Z[i])
+            for i in range(self.Z.shape[0])
         ]
 
         emps = zip(*emps)
@@ -480,17 +476,17 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
             elif v.ndim == 3 and v.shape[1] == pte.shape[1]:
                 v = (pte * v).sum(0)
             else:
-                # These are, e.g. the x0 and E0 parameters
+                # These are, e.g. the x0 and V0 parameters
                 v = v[0]
 
             result.append(v)
 
         return tuple(result)
 
-    def em_A(self, *args, **kwargs):
-        raise ValueError('[KalmanMeasurementHMM] Cannot optimize the measurement matrix (A) in a measurement HMM')
+    def em_Z(self, *args, **kwargs):
+        raise ValueError('[KalmanMeasurementHMM] Cannot optimize the measurement matrix (Z) in a measurement HMM')
 
-    def em_once(self, *args, em_vars=['P', 'Phi', 'Q', 'C', 'R', 'U', 'x0', 'E0'], strict=False, starting_likelihood=None, **kwargs):
+    def em_once(self, *args, strict=False, starting_likelihood=None, **kwargs):
         cached = None
 
         def smooth():
@@ -500,34 +496,35 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
             return cached
 
         smooth_params = None
-        nll = None
-        # if 'pi' in em_vars:
-        #     *smooth_params, pts, pys = smooth()
-        #     p0 = pts[0]
-        #     self.pi = self.em_pi((pts, pys, p0))
+        if 'em_vars' in kwargs:
+            nll = None
+            # if 'pi' in em_vars:
+            #     *smooth_params, pts, pys = smooth()
+            #     p0 = pts[0]
+            #     self.pi = self.em_pi((pts, pys, p0))
 
-        if 'P' in em_vars:
-            ll = None
-            if self.log_level == 'debug':
-                ll = self.log_likelihood()
+            if 'P' in kwargs['em_vars']:
+                ll = None
+                if self.log_level == 'debug':
+                    ll = self.log_likelihood()
 
-            *smooth_params, pts, pys, pxns = smooth()
-            p0 = pts[0]
-            self.P = self.em_P((pts, pxns, p0))
+                *smooth_params, pts, pys, pxns = smooth()
+                p0 = pts[0]
+                self.P = self.em_P((pts, pxns, p0))
 
-            if self.log_level == 'debug':
-                nll = self.log_likelihood()
-                print('\tP: {:.2f}'.format(nll))
-                if ll > nll:
-                    print('[KalmanMeasurementHMM] Likelihood decreased optimizing P: {:.4f} -> {:.4f}'.format(ll, nll))
+                if self.log_level == 'debug':
+                    nll = self.log_likelihood()
+                    print('\tP: {:.2f}'.format(nll))
+                    if ll > nll:
+                        print('[KalmanMeasurementHMM] Likelihood decreased optimizing P: {:.4f} -> {:.4f}'.format(ll, nll))
 
-                starting_likelihood = nll
+                    starting_likelihood = nll
 
         # Remove the default inclusion of the measurement matrix as a parameter to be optimized
-        return KalmanFilter.em_once(self, *args, **kwargs, em_vars=em_vars, strict=strict, starting_likelihood=starting_likelihood)
+        return KalmanFilter.em_once(self, *args, **kwargs, strict=strict, starting_likelihood=starting_likelihood)
 
     def smooth_cov_init(self, pt, K, Pn1):
-        covs = [KalmanFilter.smooth_cov_init(self, K, Pn1, A=self.A[i]) for i in range(self.A.shape[0])]
+        covs = [KalmanFilter.smooth_cov_init(self, K, Pn1, Z=self.Z[i]) for i in range(self.Z.shape[0])]
         covs = np.array(covs)
         pt = np.expand_dims(pt, [1, 2])
         return (pt * covs).sum(0)
@@ -540,7 +537,7 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
         pxns = np.array(pxns)
 
         cov_init = self.smooth_cov_init(pts[-1], filter_params[-1][-1], filter_params[-2][-2])
-        return *self._smooth(filter_params, A=self.A[0], cov_init=cov_init), pts, pys, pxns
+        return *self._smooth(filter_params, Z=self.Z[0], cov_init=cov_init), pts, pys, pxns
 
     def named_params(self):
         p = KalmanFilter.named_params(self)
