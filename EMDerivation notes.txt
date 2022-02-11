@@ -1,0 +1,5 @@
+Eq. 209 and Eq. 205 appear to be using 1 subscripts on some of their deltas when they should be ts
+
+The expressions I_lambda is equal to I - I_l and vice versa, but all four forms (I_lambda, I_L, I - I_lambda, I - I_L) are used throughout, which is a little confusing.
+
+I don't think I understand section 8.4.4 at all.
