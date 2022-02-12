@@ -159,7 +159,7 @@ class HMM:
         pass
 
     def em(self, y, n=10, strict=False):
-        # Note: Estimating the C parameter can lead to instability, due to its feedback effects
+        # Note: Estimating the U parameter can lead to instability, due to its feedback effects
         # on probability estimation. That is, the state intercept can influence what the HMM
         # believes the states are, which causes the filtering approximation for the probabilities
         # to become insufficient.
@@ -451,7 +451,7 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
                 **kwargs
             ) for i in range(self.Z.shape[0])
         ]
-        self.lls = lls
+
         lls = np.hstack(lls)
         return (pt * lls).sum(1)
 
@@ -480,6 +480,8 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
                 v = v[0]
 
             result.append(v)
+
+        result.append(pte)
 
         return tuple(result)
 
@@ -522,6 +524,62 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
 
         # Remove the default inclusion of the measurement matrix as a parameter to be optimized
         return KalmanFilter.em_once(self, *args, **kwargs, strict=strict, starting_likelihood=starting_likelihood)
+
+    def em_x0(self, em_params, **kwargs):
+        B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params(**kwargs)        
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, pts = em_params
+
+        if 'x0' in self.constraints:
+            f, D = self.constraints['x0']
+        else:
+            f = np.zeros((1, x0.shape[0], 1))
+            D = np.eye(x0.shape[0])[None]
+
+        nums, denoms = zip(*[
+            self._em_x0_degenerate(em_params, f, D, **kwargs, Z=self.Z[i])
+            for i in range(self.Z.shape[0])
+        ])
+
+        pts = pts[:,:,:,None]
+        num = np.array(nums)
+        denom = np.array(denoms)
+
+        num = (pts * num).sum(0).sum(0)
+        denom = (pts * denom).sum(0).sum(0)
+
+        v = util.safe_inverse(denom) @ num
+        v = f + D @ v
+        x0_ = v.reshape(x0.shape)
+
+        return x0_
+
+    def em_U(self, em_params, **kwargs):
+        B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params(**kwargs)        
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, pts = em_params
+
+        if 'U' in self.constraints:
+            f, D = self.constraints['U']
+        else:
+            Usz = x0.shape[0] * state_exog.shape[1]
+            f = np.zeros((1, Usz, 1))
+            D = np.eye(Usz)[None]
+
+        nums, denoms = zip(*[
+            self._em_U_degenerate(em_params, f, D, **kwargs, Z=self.Z[i])
+            for i in range(self.Z.shape[0])
+        ])
+
+        pts = pts[:,:,:,None]
+        num = np.array(nums)
+        denom = np.array(denoms)
+        num = (pts * nums).sum(0).sum(0)
+        denom = (pts * denoms).sum(0).sum(0)
+
+        u = util.safe_inverse(denom) @ num
+        u = f + D @ u
+        U = u.reshape(U.shape)
+
+        return U
 
     def smooth_cov_init(self, pt, K, Pn1):
         covs = [KalmanFilter.smooth_cov_init(self, K, Pn1, Z=self.Z[i]) for i in range(self.Z.shape[0])]

@@ -187,6 +187,9 @@ class KalmanFilter:
         if P.ndim == 2:
             P = P[None]
 
+        if type(init) == list or type(init) == tuple:
+            init = np.array(init)
+
         var_list = []
         isfloat = re.compile('^[\d+](?:\.\d+)?$')
 
@@ -273,6 +276,8 @@ class KalmanFilter:
                     M = np.diagflat(init)
                 else:
                     raise ValueError('Unrecognized init format')
+            else:
+                raise ValueError('Unrecognized init format')
 
             Dm = D.mean(0)
             fm = f.mean(0)
@@ -284,6 +289,9 @@ class KalmanFilter:
                 v = init
             else:
                 raise ValueError('Mis-specified init vector for: {}'.format(name))
+
+        if v.ndim == 1:
+            v = v[:,None]
 
         P = (f + D @ v).reshape(P.shape)
         if P.shape[0] == 1:
@@ -560,12 +568,12 @@ class KalmanFilter:
 
         return x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov
 
-    def em_B(self, em_params, constraints={}):
+    def em_B(self, em_params):
         if self.is_degenerate():
             raise ValueError('EM updates for the B parameter in degenerate models are not currently supported')
 
         B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params()
-        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov = em_params
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
         xxt = np.transpose(xx, axes=[0, 2, 1])
 
         if B.ndim > 2:
@@ -574,10 +582,10 @@ class KalmanFilter:
         if self.is_degenerate() > 0:
             raise ValueError('Optimizing B unimplemented for degenerate variance models')
 
-        if 'B' in constraints:
+        if 'B' in self.constraints:
             GG = self.GG
             Qi = GG.T @ util.safe_inverse(Q) @ GG
-            f, D = constraints['B']
+            f, D = self.constraints['B']
             qk = np.kron(Qi, s00)
             B1 = (Qi @ (s10 - (U @ xxt))).reshape((s10.shape[0], x0.shape[0] ** 2, 1))
 
@@ -587,7 +595,7 @@ class KalmanFilter:
             B2 = Dt @ qk @ D
             b = util.safe_inverse(B2.sum(0)) @ B1.sum(0)
             b = f + D @ b
-            B = B.reshape((D.shape[0], *B.shape[-2:]))
+            B = b.reshape((D.shape[0], *B.shape[-2:]))
             if B.shape[0] == 1:
                 B = B[0]
         else:
@@ -597,9 +605,9 @@ class KalmanFilter:
 
         return B
 
-    def em_Q(self, em_params, constraints={}):
+    def em_Q(self, em_params):
         B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params()
-        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov = em_params
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
 
         if Q.ndim > 2:
             raise ValueError('Cannot optimize Q when it is initialized to be time-varying')
@@ -623,8 +631,8 @@ class KalmanFilter:
 
         qs = self.GG @ qs @ self.GG.T
         self.qs = qs
-        if 'Q' in constraints:
-            f, D = constraints['Q']
+        if 'Q' in self.constraints:
+            f, D = self.constraints['Q']
             Dt = np.transpose(D, axes=[0, 2, 1])
 
             q = qs.reshape((qs.shape[0], qs.shape[1] ** 2, 1))
@@ -641,19 +649,9 @@ class KalmanFilter:
         Q = util.symm(Q)
         return Q
 
-    def em_U(self, em_params, constraints={}):
-        B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params()
-        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov = em_params
-
-        if U.ndim > 2:
-            raise ValueError('Cannot optimize U when it is initialized to be time-varying')
-
-        if 'U' in constraints:
-            f, D = constraints['U']
-        else:
-            Usz = x0.shape[0] * state_exog.shape[1]
-            f = np.zeros((1, Usz, 1))
-            D = np.eye(Usz)[None]
+    def _em_U_degenerate(self, em_params, f, D, **kwargs):
+        B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params(**kwargs)
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
 
         Qf = G @ Q @ G.T
         Rf = H @ R @ H.T
@@ -661,17 +659,18 @@ class KalmanFilter:
         Bstar = [np.eye(x0.shape[0])]
         
         for i in range(self.y.shape[0]):
-            Bi, *_ = self.params_idx(i)
+            Bi, *_ = self.params_idx(i, **kwargs)
             Bstar.append(Bi @ Bstar[-1])
 
         self.Bstar = np.array(Bstar)
 
         fustar, Dustar, DE, SE, DS, SS = self.fustar, self.Dustar, self.DE, self.SE, self.DS, self.SS
 
-        Delta1 = self.y - Z @ SS[1:] @ x - (Z @ DS[1:] @ (Bstar[1:] @ x0 + fustar[1:])) - ya
+        Xt0 = self.expected_x0(em_params)
+        Delta1 = self.y - Z @ SS[1:] @ x - (Z @ DS[1:] @ (Bstar[1:] @ Xt0 + fustar[1:])) - ya
         Delta2 = Z @ DS[1:] @ Dustar[1:]
-        Delta3 = x - B @ SS[:-1] @ xx - B @ DS[:-1] @ (Bstar[:-1] @ x0 + fustar[:-1]) - f
-        Delta3[0] = x[0] - B @ x0 - f[0]
+        Delta3 = x - B @ SS[:-1] @ xx - B @ DS[:-1] @ (Bstar[:-1] @ Xt0 + fustar[:-1]) - f
+        Delta3[0] = x[0] - B @ Xt0 - f[0]
         Delta4 = D + B @ DS[:-1] @ Dustar[:-1]
         Delta4[0] = D
 
@@ -684,63 +683,97 @@ class KalmanFilter:
         Delta4t = np.transpose(Delta4, axes=[0, 2, 1])
         Delta2t = np.transpose(Delta2, axes=[0, 2, 1])
 
-        V1 = Delta4t @ Qi @ Delta3 + Delta2t @ Ri @ Delta1
-        V2 = Delta4t @ Qi @ Delta4 + Delta2t @ Ri @ Delta2
-        v = np.linalg.inv(V2.sum(0)) @ V1.sum(0)
+        num = Delta4t @ Qi @ Delta3 + Delta2t @ Ri @ Delta1
+        denom = Delta4t @ Qi @ Delta4 + Delta2t @ Ri @ Delta2
+        return num, denom
 
-        c = f + D @ v
-        U = c.reshape((D.shape[0], *U.shape[-2:]))
+    def em_U(self, em_params):
+        B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params()
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
+
+        if U.ndim > 2:
+            raise ValueError('Cannot optimize U when it is initialized to be time-varying')
+
+        if 'U' in self.constraints:
+            f, D = self.constraints['U']
+        else:
+            Usz = x0.shape[0] * state_exog.shape[1]
+            f = np.zeros((1, Usz, 1))
+            D = np.eye(Usz)[None]
+
+        num, denom = self._em_U_degenerate(em_params, f, D)
+        v = util.safe_inverse(denom.sum(0)) @ num.sum(0)
+
+        u = f + D @ v
+        U = u.reshape((D.shape[0], *U.shape[-2:]))
         if U.shape[0] == 1:
             U = U[0]
 
         return U
 
-    def em_x0(self, em_params, constraints={}):
+    def expected_x0(self, em_params, **kwargs):
+        B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params(**kwargs)        
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
+        # Take the stochastic components from the latest estimate, and the non-stochastic
+        # components from the prior estimate
+        SE, DE = self.SE, self.DE
+        return SE @ x0_ + DE @ x0
+
+    def _em_x0_degenerate(self, em_params, f, D, **kwargs):
+        B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params(**kwargs)
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
+
+        DS, SS, DE, SE = self.DS, self.SS, self.DE, self.SE
+    
+        Ustar = [0 * (U[0] if U.ndim == 3 else U)]
+        Bstar = [np.eye(x0.shape[0])]
+
+        for i in range(self.y.shape[0]):
+            Bi, Zi, Ui, Qi, Ri, Ai, x0, V0, Gi, Hi, Fi = self.params_idx(i, **kwargs)
+            Bstar.append(Bi @ Bstar[-1])
+            Ustar.append(Bi @ Ustar[-1] + Ui)
+
+        Bstar = np.array(Bstar)
+        Ustar = np.array(Ustar)
+
+        Delta5 = self.y - Z @ SS[1:] @ x - Z @ DS[1:] @ ((Bstar[1:] @ SE @ x0 + DE @ f) + Ustar[1:]) - A
+        Delta6 = Z @ DS[1:] @ Bstar[1:] @ DE @ D
+        Delta7 = x - B @ SS[:-1] @ xx - B @ DS[:-1] @ ((Bstar[:-1] @ SE @ x0 + DE @ f) + Ustar[:-1]) - U
+        Delta7[0] = x[0] - B @ (SE @ x0 + DE @ f[0]) - (U[0] if U.ndim == 3 else U)
+        Delta8 = B @ DS[:-1] @ Bstar[:-1] @ DE @ D
+        Delta8[0] = B @ DE @ D[0]
+
+        Dt = np.transpose(D, axes=[0, 2, 1])
+        Delta6t = np.transpose(Delta6, axes=[0, 2, 1])
+        Delta8t = np.transpose(Delta8, axes=[0, 2, 1])
+
+        GG = self.GG
+        Qi = GG.T @ util.safe_inverse(Q) @ GG
+
+        HH = self.HH
+        Ri = HH.T @ util.safe_inverse(R) @ HH
+
+        FF = np.linalg.inv(F.T @ F) @ F.T
+        V0i = FF.T @ util.safe_inverse(V0) @ FF
+
+        Xt0 = self.expected_x0(em_params)
+
+        num = Delta8t @ Qi @ Delta7 + Delta6t @ Ri @ Delta5 + Dt @ V0i @ (Xt0 - f)        
+        denom = Delta8t @ Qi @ Delta8 + Delta6t @ Ri @ Delta6 + Dt @ V0i @ D
+
+        return num, denom
+
+    def em_x0(self, em_params):
         B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params()
-        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov = em_params
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
 
         V0f = F @ V0 @ F.T
         z = np.diag(V0f) == 0.0
         if z.all():
             if 'x0' in self.constraints:
                 f, D = self.constraints['x0']
-                DS, SS, DE, SE = self.DS, self.SS, self.DE, self.SE
-        
-                Ustar = [0 * (U[0] if U.ndim == 3 else U)]
-                Bstar = [np.eye(x0.shape[0])]
-
-                for i in range(self.y.shape[0]):
-                    Bi, Zi, Ui, Qi, Ri, Ai, x0, V0, Gi, Hi, Fi = self.params_idx(i)
-                    Bstar.append(Bi @ Bstar[-1])
-                    Ustar.append(Bi @ Ustar[-1] + Ui)
-
-                Bstar = np.array(Bstar)
-                Ustar = np.array(Ustar)
-
-                Delta5 = self.y - Z @ SS[1:] @ x - Z @ DS[1:] @ ((Bstar[1:] @ SE @ x0 + DE @ f) + Ustar[1:]) - A
-                Delta6 = Z @ DS[1:] @ Bstar[1:] @ DE @ D
-                Delta7 = x - B @ SS[:-1] @ xx - B @ DS[:-1] @ ((Bstar[:-1] @ SE @ x0 + DE @ f) + Ustar[:-1]) - U
-                Delta7[0] = x[0] - B @ (SE @ x0 + DE @ f[0]) - (U[0] if U.ndim == 3 else U)
-                Delta8 = B @ DS[:-1] @ Bstar[:-1] @ DE @ D
-                Delta8[0] = B @ DE @ D[0]
-
-                Dt = np.transpose(D, axes=[0, 2, 1])
-                Delta6t = np.transpose(Delta6, axes=[0, 2, 1])
-                Delta8t = np.transpose(Delta8, axes=[0, 2, 1])
-
-                GG = self.GG
-                Qi = GG.T @ util.safe_inverse(Q) @ GG
-
-                HH = self.HH
-                Ri = HH.T @ util.safe_inverse(R) @ HH
-
-                FF = np.linalg.inv(F.T @ F) @ F.T
-                V0i = FF.T @ util.safe_inverse(V0) @ FF
-
-                V1 = Delta8t @ Qi @ Delta8 + Delta6t @ Ri @ Delta6 + Dt @ V0i @ D
-                V2 = Delta8t @ Qi @ Delta7 + Delta6t @ Ri @ Delta5 + Dt @ V0i @ (x0 - f)
-
-                p = np.linalg.inv(V1.sum(0)) @ V2.sum(0)
+                num, denom = self._em_x0_degenerate(em_params)
+                p = util.safe_inverse(denom.sum(0)) @ num.sum(0)
                 x0_ = f + D @ p
                 x0_ = x0_.reshape(x0.shape)
             else:
@@ -754,22 +787,22 @@ class KalmanFilter:
 
         return x0_
 
-    def em_V0(self, em_params, constraints={}):
-        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov = em_params
+    def em_V0(self, em_params):
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
         return V0_
 
-    def em_Z(self, em_params, constraints={}):
+    def em_Z(self, em_params):
         B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params()
-        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov = em_params
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
 
         if Z.ndim > 2:
             raise ValueError('Cannot optimize Z when it is initialized to be time-varying')
 
-        if 'Z' in constraints:
+        if 'Z' in self.constraints:
             HH = self.HH
             Ri = HH.T @ util.safe_inverse(R) @ HH
 
-            f, D = constraints['Z']
+            f, D = self.constraints['Z']
             Dt = np.transpose(D, axes=[0, 2, 1])
             xt = np.transpose(x, axes=[0, 2, 1])
 
@@ -796,15 +829,15 @@ class KalmanFilter:
 
         return Z
 
-    def em_A(self, em_params, constraints={}):
+    def em_A(self, em_params):
         B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params()
-        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov = em_params
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
 
         if A.ndim > 2:
             raise ValueError('Cannot optimize A when it is initialized to be time-varying')
 
-        if 'A' in constraints:
-            f, D = constraints['A']
+        if 'A' in self.constraints:
+            f, D = self.constraints['A']
         else:
             Asz = H.shape[0] * obs_exog.shape[1]
             f = np.zeros((Asz, 1))
@@ -830,17 +863,17 @@ class KalmanFilter:
 
         return A
 
-    def em_R(self, em_params, constraints={}):
+    def em_R(self, em_params):
         B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params()
-        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov = em_params
+        x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov, *_ = em_params
 
         if R.ndim > 2:
             raise ValueError('Cannot optimize R when it is initialized to be time-varying')
 
         resid_cov = self.HH @ resid_cov @ self.HH.T
 
-        if 'R' in constraints:
-            f, D = constraints['R']
+        if 'R' in self.constraints:
+            f, D = self.constraints['R']
             Dt = np.transpose(D, axes=[0, 2, 1])
             r = resid_cov.reshape((resid_cov.shape[0], resid_cov.shape[1] ** 2, 1))
             r = np.linalg.inv(resid_cov.shape[0] * Dt @ D) @ (Dt @ r).sum(axis=0)
@@ -871,7 +904,7 @@ class KalmanFilter:
     def debug(self, *args):
         return self.log(*args, level='debug')
 
-    def em_once(self, em_vars=['B', 'Q', 'Z', 'U', 'R', 'A', 'x0', 'V0'], starting_likelihood=None, strict=False, constraints={}, i=0):
+    def em_once(self, em_vars=['B', 'Q', 'Z', 'U', 'R', 'A', 'x0', 'V0'], starting_likelihood=None, strict=False, i=0):
         # Order shouldn't matter if we're operating in strict mode where we re-compute the filters/smoothers
         # on every iteration, but that's not the default, and I think order might matter in non-strict mode
         # order = ['B', 'Q', 'Z', 'U', 'R', 'A', 'x0', 'V0']    
@@ -889,7 +922,7 @@ class KalmanFilter:
                     em_params = self.em_params()
 
                 fn = getattr(self, mname)
-                result = fn(em_params, constraints=constraints)
+                result = fn(em_params)
                 setattr(self, name, result)
 
                 # Do the if check here just to avoid computing the log_likelihood if we don't have to
@@ -915,7 +948,7 @@ class KalmanFilter:
         tol = 1e-2
 
         for i in range(n):
-            ll = self.em_once(starting_likelihood=ll, constraints=self.constraints, i=i, **kwargs)
+            ll = self.em_once(starting_likelihood=ll, i=i, **kwargs)
             if (i + 1) % 10 == 0:
                 ll = self.log_likelihood()
                 print('\t[{}] ll: {:.6f}'.format(i + 1, ll))
@@ -929,6 +962,8 @@ class KalmanFilter:
         if n % 10 != 0:
             ll = self.log_likelihood()
             print('[{}] ll: {:.6f}'.format(n, ll))
+
+        self.describe_fit()
 
     def innovations(self, **kwargs):
         x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov = self.em_params(**kwargs)
