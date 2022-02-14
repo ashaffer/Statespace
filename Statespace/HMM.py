@@ -167,7 +167,7 @@ class HMM:
 
         prev_ll = -np.inf
         for i in range(n):
-            self.em_once(y, strict=strict, constraints=self.constraints)
+            self.em_once(y, strict=strict)
 
             ll = self.log_likelihood(y)
             print('\t[{}] ll: {:.2f}'.format(i, ll))
@@ -381,6 +381,17 @@ class KalmanMeasurementHMM(KalmanFilter, HMM):
 
     def hmm_params(self):
         return self.P, self.pi
+
+    def predict(self):
+        xp, ptp, xf, ptf, ks, pts, pys = self.filter()
+        yhats = np.array([
+            self.Z[i] @ xp for i in range(self.Z.shape[0])
+        ])
+
+        pte = np.expand_dims(pts, [2, 3])
+        pte = np.swapaxes(pte, 0, 1)
+        return (pte * yhats).sum(0)
+
 
     def filter(self, pmin=1e-16):
         xp = []

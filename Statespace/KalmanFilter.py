@@ -8,9 +8,11 @@ class KalmanFilter:
         'B': np.array([1.0]),
         'U': np.array([0.0]),
         'Q': np.array([0.05]),
+        'G': np.array([1.0]),
         'Z': np.array([1.0]),
         'A': np.array([0.0]),
         'R': np.array([0.05]),
+        'H': np.array([1.0]),
         'x0': np.array([0.00]),
         'V0': np.array([0.05]),
     }
@@ -67,10 +69,10 @@ class KalmanFilter:
         self.Z = Z = np.ones((obs_dim, state_dim)) if Z is None else self.init_param('Z', Z, inits['Z'])
         self.Q = Q = np.eye(state_dim) if Q is None else self.init_param('Q', Q, inits['Q'])
         self.R = R = np.eye(obs_dim) if R is None else self.init_param('R', R, inits['R'])
-        self.G = G = np.eye(Q.shape[0]) if G is None else G
-        self.H = H = np.eye(R.shape[0]) if H is None else H
+        self.G = G = np.eye(Q.shape[0]) if G is None else self.init_param('G', G, inits['G'])
+        self.H = H = np.eye(R.shape[0]) if H is None else self.init_param('H', H, inits['H'])
         self.x0 = x0 = np.zeros((G.shape[0], 1)) if x0 is None else self.init_param('x0', x0, inits['x0'])
-        self.V0 = V0 = np.zeros((Q.shape[-1], Q.shape[-1])) if V0 is None else self.init_param('V0', V0, inits['V0'])
+        self.V0 = V0 = np.zeros((state_dim, state_dim)) if V0 is None else self.init_param('V0', V0, inits['V0'])
         self.F = F = np.eye(V0.shape[-1]) if F is None else F        
         self.U = U = np.zeros((state_dim, state_exog.shape[1])) if U is None else self.init_param('U', U, inits['U'])
         self.A = A = np.zeros((obs_dim, obs_exog.shape[1])) if A is None else self.init_param('A', A, inits['A'])
@@ -425,8 +427,6 @@ class KalmanFilter:
         for i,v in enumerate(self.y):
             xtt1, Ptt1 = self.predict_once(i, xtt, Ptt, xa[i])
             xtt, Ptt, K = self.filter_once(i, xtt1, Ptt1, v, ya[i])
-            if np.isnan(xtt).any():
-                print(i)
 
             xp.append(xtt1)
             xf.append(xtt)
@@ -533,7 +533,12 @@ class KalmanFilter:
         return self._log_likelihoods(filter_params, **kwargs)
 
     def log_likelihood(self, **kwargs):
-        return self.log_likelihoods(**kwargs).sum()
+        lls = self.log_likelihoods(**kwargs)
+        
+        if np.isnan(lls).any():
+            return np.nan
+
+        return lls.sum()
 
     def em_params(self, **kwargs):
         smooth_params = self.smooth(**kwargs)
@@ -904,6 +909,10 @@ class KalmanFilter:
     def debug(self, *args):
         return self.log(*args, level='debug')
 
+    def fit(self, em_tol=0.1):
+        self.em(tol=em_tol)
+        self.minimize()
+
     def em_once(self, em_vars=['B', 'Q', 'Z', 'U', 'R', 'A', 'x0', 'V0'], starting_likelihood=None, strict=False, i=0):
         # Order shouldn't matter if we're operating in strict mode where we re-compute the filters/smoothers
         # on every iteration, but that's not the default, and I think order might matter in non-strict mode
@@ -911,6 +920,13 @@ class KalmanFilter:
         order = ['R', 'Q', 'x0', 'V0', 'A', 'U', 'B', 'Z']
         prev_ll = starting_likelihood
         em_params = None
+
+        for name in em_vars:
+            if name not in order:
+                if name == 'G' or name == 'H':
+                    print('Warning: No EM updater is implemented for {} yet. The EM pass will not fit your {} variables, you can fit them in a second pass with .minimize()'.format(name, name))
+                else:
+                    raise ValueError('[KalmanFilter] Unrecognized em_var: {}'.format(name))
 
         for name in order:
             if name in em_vars:
@@ -937,26 +953,40 @@ class KalmanFilter:
 
         return prev_ll
 
-    def em(self, n=10, **kwargs):
-        if 'em_vars' not in kwargs or kwargs['em_vars'] is None:
-            kwargs['em_vars'] = list(self.constraints.keys())
+    def em(self, n=10, tol=None, eps=1e-2, em_vars=None, **kwargs):
+        if em_vars is None:
+            em_vars = list(self.constraints.keys())
+
+        print('Starting EM on: {}'.format(', '.join(em_vars)))
 
         ll = self.log_likelihood()
         print('\t[0] ll: {:.6f}'.format(ll))
 
         prev = -np.inf
-        tol = 1e-2
+
+        if tol is not None:
+            n = 10000
 
         for i in range(n):
-            ll = self.em_once(starting_likelihood=ll, i=i, **kwargs)
+            ll = self.em_once(starting_likelihood=ll, i=i, em_vars=em_vars, **kwargs)
+
             if (i + 1) % 10 == 0:
                 ll = self.log_likelihood()
+
                 print('\t[{}] ll: {:.6f}'.format(i + 1, ll))
-                if ll < prev - tol:
-                    raise ValueError('Error likelihood decreased ({} -> {})'.format(prev, ll))
-                prev = ll
+
                 if np.isnan(ll):
                     raise ValueError('nan encountered')
+
+                delta = ll - prev        
+
+                if tol is not None and delta < tol:                    
+                    break
+
+                if delta < -eps:
+                    raise ValueError('Error likelihood decreased ({} -> {})'.format(prev, ll))
+
+                prev = ll
 
         # If we ended on a multiple o 10, the last ll was already printed
         if n % 10 != 0:
@@ -964,6 +994,7 @@ class KalmanFilter:
             print('[{}] ll: {:.6f}'.format(n, ll))
 
         self.describe_fit()
+        print('')
 
     def innovations(self, **kwargs):
         x, xx, pt, s11, s10, s00, e, xa, ya, x0_, V0_, resid_cov = self.em_params(**kwargs)
