@@ -1136,7 +1136,7 @@ class KalmanFilter:
             return l
 
         params = np.concatenate(args)
-
+        print('Minimizing: {}'.format(', '.join(optimize)))
         print('Starting likelihood: {:.2f} ({:.2f})'.format(
             -self.params_likelihood(params, constants),
             self.log_likelihood()

@@ -27,6 +27,43 @@ kf = KalmanFilter(
 kf.fit()
 ```
 
+This should output something like:
+
+```
+Starting EM on: B, Z, R
+	[0] ll: -1867.349491
+	[10] ll: -1462.598377
+	[20] ll: -1438.460797
+	[30] ll: -1428.766103
+	[40] ll: -1423.972850
+	[50] ll: -1421.256981
+	[60] ll: -1419.564740
+	[70] ll: -1418.434631
+	[80] ll: -1417.639221
+	[90] ll: -1417.055898
+	[100] ll: -1416.613761
+	[110] ll: -1416.269444
+	[120] ll: -1415.995182
+	[130] ll: -1415.772502
+	[140] ll: -1415.588714
+	[150] ll: -1415.434856
+	[160] ll: -1415.304445
+	[170] ll: -1415.192692
+	[180] ll: -1415.095996
+Fitted:
+	phi: 0.4616
+	theta: 0.2144
+	measurement_noise: 0.0427
+
+Minimizing: B, Z, R
+Starting likelihood: -1415.10 (-1415.10)
+Minimized: -1413.78
+Fitted:
+	phi: 0.4822
+	theta: 0.1567
+	measurement_noise: 0.0000
+```
+
 `.fit()` uses a combination of the EM algorithm and BFGS to automatically fit your model. It is just a convenience wraper for:
 
 ```python
