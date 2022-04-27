@@ -23,7 +23,7 @@ def solve_triangular(L, Y):
     arr = []
     
     for i in range(L.shape[0]):
-        arr.append(sp.linalg.solve_triangular(L[i], Y[i].T, lower=True, check_finite=False))
+        arr.append(sp.linalg.solve_triangular(L[i], Y[i], lower=True, check_finite=False))
     
     return np.array(arr)
 
@@ -128,19 +128,6 @@ def safe_inverse(C):
             print('Inverse failed')
             print(C)
             return np.linalg.pinv(C)
-
-def constraint_str_to_matrix(s, dims):
-    if s == 'lower_triangular_s1':
-        M = np.full(dims, np.nan)
-        for i in range(dims[1] - 1):
-            for j in range(dims[1]):
-                if j > i:
-                    M[i][j] = 0.0
-    elif s == 'sq_diag':
-        d = np.full(dims[0], np.nan)
-        M = np.diagflat(d)
-
-    return M
 
 def constraint_matrices(M):
     if M.ndim == 1:

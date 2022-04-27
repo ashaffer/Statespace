@@ -4,7 +4,9 @@ from . import util
 import re
 
 class KalmanFilter:
-    default_values = {
+    # These are what we default to for unspecified individual
+    # elements within a parameter vector/matrix
+    default_parameter_scalars = {
         'B': np.array([1.0]),
         'U': np.array([0.0]),
         'Q': np.array([0.05]),
@@ -15,67 +17,66 @@ class KalmanFilter:
         'H': np.array([1.0]),
         'x0': np.array([0.00]),
         'V0': np.array([0.05]),
+        'F': np.array([1.0])
     }
 
-    def __init__(self, y, B=None, Z=None, Q=None, R=None, x0=None, V0=None, U=None, A=None, G=None, H=None, F=None, inits={}, state_exog=None, obs_exog=None):
+    # Defaults for the entire parameter, if unspecified
+    default_parameters = {
+        'B': 'zeros',
+        'U': 'zeros',
+        'Q': 'identity',
+        'G': 'identity',
+        'Z': 'ones',
+        'A': 'zeros',
+        'H': 'identity',
+        'R': 'identity',
+        'x0': 'zeros',
+        'V0': 'zeros',
+        'F': 'identity'
+    }
+
+    def __init__(self, y, B=None, Z=None, Q=None, R=None, x0=None, V0=None, U=None, A=None, G=None, H=None, F=None, inits={}, state_exog=None, obs_exog=None, state_dim=None):
         # Expand the dimensions to 3. i.e. n_samples, m_obs, 1
         if y.ndim == 1:
             y = y[:,None]
         if y.ndim == 2:
             y = y[:,:,None]
 
+        self.y = y
+
         if x0 is not None and x0.ndim == 1:
             x0 = x0[:,None]
 
-        # Do our best to infer all the dimensions from whatever is specified, so that we can
-        # generate default values for the unspecified ones.
-        obs_dim = y.shape[1]
-        
-        if B is not None:
-            state_dim = B.shape[1]
-        elif Q is not None:
-            if G is not None:
-                state_dim = G.shape[0] if G.ndim == 2 else G.shape[1]
-            else:
-                state_dim = Q.shape[1]
-        elif x0 is not None:
-            state_dim = x0.shape[0]
-        elif V0 is not None:
-            if F is not None:
-                state_dim = F.shape[0]
-            else:
-                state_dim = V0.shape[0]
-        elif U is not None:
-            state_dim = U.shape[0] if U.ndim == 2 else U.shape[1]
-
-        # By default we include a constant term, in order to 
+        # By default we include a constant term, in order to
         # fit an intercept if nothing else is specified
         if state_exog is None:
             state_exog = self.default_state_exog(y)
-        
+
         if obs_exog is None:
             obs_exog = self.default_obs_exog(y)
 
-        # Iniitialize any unspecified parameters to reasonable defaults
-        for k in self.default_values:
-            inits[k] = inits[k] if k in inits else self.default_values[k]
+        params = {'B': B, 'Z': Z, 'Q': Q, 'R': R, 'x0': x0, 'V0': V0, 'U': U, 'A': A, 'G': G, 'H': H, 'F': F}
+        dims = self.infer_dims(params, state_exog, obs_exog, state_dim=state_dim)
 
-        self.y = y
+        # Iniitialize any unspecified parameters to reasonable defaults
+        for k in self.default_parameter_scalars:
+            inits[k] = inits[k] if k in inits else self.default_parameter_scalars[k]
+
+        #
+        # Initialize parameters
+        #
+
         self.state_exog = state_exog
         self.obs_exog = obs_exog
         self.constraints = {}
         self.variable_names = {}
-        self.B = B = np.zeros((state_dim, state_dim)) if B is None else self.init_param('B', B, inits['B'])
-        self.Z = Z = np.ones((obs_dim, state_dim)) if Z is None else self.init_param('Z', Z, inits['Z'])
-        self.Q = Q = np.eye(state_dim) if Q is None else self.init_param('Q', Q, inits['Q'])
-        self.R = R = np.eye(obs_dim) if R is None else self.init_param('R', R, inits['R'])
-        self.G = G = np.eye(Q.shape[0]) if G is None else self.init_param('G', G, inits['G'])
-        self.H = H = np.eye(R.shape[0]) if H is None else self.init_param('H', H, inits['H'])
-        self.x0 = x0 = np.zeros((G.shape[0], 1)) if x0 is None else self.init_param('x0', x0, inits['x0'])
-        self.V0 = V0 = np.zeros((state_dim, state_dim)) if V0 is None else self.init_param('V0', V0, inits['V0'])
-        self.F = F = np.eye(V0.shape[-1]) if F is None else F        
-        self.U = U = np.zeros((state_dim, state_exog.shape[1])) if U is None else self.init_param('U', U, inits['U'])
-        self.A = A = np.zeros((obs_dim, obs_exog.shape[1])) if A is None else self.init_param('A', A, inits['A'])
+        self.unconstrained = []
+
+        for name, P in params.items():
+            P = self.init_param(name, P, inits[name], dims[name])
+            setattr(self, name, P)
+
+        B, Z, U, Q, R, A, x0, V0, G, H, F, state_exog, obs_exog = self.params()
 
         self.validate_dims()
 
@@ -95,26 +96,6 @@ class KalmanFilter:
         self.GG = np.linalg.inv(G.T @ G) @ G.T
         self.HH = np.linalg.inv(H.T @ H) @ H.T
 
-        params = {
-            'B': self.B,
-            'Z': self.Z,
-            'Q': self.Q,
-            'R': self.R,
-            'x0': self.x0,
-            'V0': self.V0,
-            'U': self.U,
-            'A': self.A
-        }
-
-        for key in self.constraints:
-            U = self.constraints[key]
-
-            if type(U) == str:
-                U = util.constraint_str_to_matrix(U, params[key].shape)
-
-            if type(U) == np.ndarray:
-                self.constraints[key] = util.constraint_matrices(U)
-
         #
         # Generate stochasticity matrices for the degenerate variance
         # case (Section 7-8)
@@ -123,12 +104,12 @@ class KalmanFilter:
         ds, inds, S = util.reachable_edges(util.to_adjacency(self.B), (~qz).astype(float))
         self.DS = DS = util.extend_matrices(self.y.shape[0] + 1, [np.eye(x0.shape[0]), *ds])
         self.IS = IS = util.extend_matrices(self.y.shape[0] + 1, [np.zeros(DS[0].shape), *inds])
-        self.SS = SS = np.eye(state_dim) - DS
+        self.SS = SS = np.eye(self.B.shape[-1]) - DS
 
         # I_lambda in the paper (deterministic initial states)
         self.DE = DE = np.diagflat(e0z.astype(float))
         # I_l in the paper (stochastic initial states)
-        self.SE = SE = np.eye(state_dim) - DE
+        self.SE = SE = np.eye(self.B.shape[-1]) - DE
 
         # These are only using the f/D matrix structures over time
         # *not* the actual values of the U parameter, which is why
@@ -146,8 +127,88 @@ class KalmanFilter:
         self.fustar = np.array(fustar)
         self.Dustar = np.array(Dustar)
 
+    def infer_dims(self, params, state_exog, obs_exog, state_dim=None):
+        x0_dim = x0_cov_dim = None
+        state_cov_dim = state_exog_dim = None
+        obs_cov_dim = obs_exog_dim = None
+
+        x0, V0, F = params['x0'], params['V0'], params['F']
+        B, G, Q, U = params['B'], params['G'], params['Q'], params['U']
+        Z, R, H, A = params['Z'], params['R'], params['H'], params['A']
+
+        # Infer state dimension
+        if state_dim is None:
+            if hasattr(B, 'shape'):
+                state_dim = B.shape[-2]
+            elif hasattr(G, 'shape'):
+                state_dim = G.shape[-2]
+            elif hasattr(Q, 'shape'):
+                state_dim = Q.shape[-2]
+            elif hasattr(Z, 'shape'):
+                state_dim = Z.shape[-1]
+            elif hasattr(x0, 'shape'):
+                state_dim = x0.shape[-2]
+            else:
+                raise ValueError('[KalmanFilter] Unable to infer state dimension')
+
+        # Infer state covariance dimension
+        if hasattr(G, 'shape'):
+            state_cov_dim = G.shape[-1]
+        else:
+            state_cov_dim = state_dim
+
+        # Infer initial state dimensions
+        if hasattr(x0, 'shape'):
+            x0_dim = x0.shape[-2]
+        elif hasattr(F, 'shape'):
+            x0_dim = F.shape[-2]
+        elif hasattr(V0, 'shape'):
+            x0_dim = V0.shape[-2]
+        else:
+            x0_dim = state_dim
+
+        # Infer initial state covariance dimensions
+        if hasattr(F, 'shape'):
+            x0_cov_dim = F.shape[-1]
+        elif hasattr(V0, 'shape'):
+            x0_cov_dim = V0.shape[-1]
+        else:
+            x0_cov_dim = x0_dim
+
+        # Infer observation dimensions
+        obs_dim = self.y.shape[-2]
+
+        # Infer the obs covariance dimensions
+        if hasattr(H, 'shape'):
+            obs_cov_dim = H.shape[-1]
+        else:
+            obs_cov_dim = obs_dim
+
+        # Infer the dimensions of the exogenous variables
+        state_exog_dim = state_exog.shape[-2]
+        obs_exog_dim = obs_exog.shape[-2]
+
+        return {
+            # Initial state
+            'x0': (x0_dim, 1),
+            'V0': (x0_cov_dim, x0_cov_dim),
+            'F': (x0_dim, x0_cov_dim),
+
+            # State
+            'B': (state_dim, state_dim),
+            'Q': (state_cov_dim, state_cov_dim),
+            'G': (state_dim, state_cov_dim),
+            'U': (state_dim, state_exog_dim),
+
+            # Observations
+            'Z': (obs_dim, state_dim),
+            'R': (obs_cov_dim, obs_cov_dim),
+            'H': (obs_dim, obs_cov_dim),
+            'A': (obs_dim, obs_exog_dim)
+        }
+
     def validate_dims(self):
-        n = self.y[0]
+        n = self.y.shape[0]
         x0_cov_dim = self.F.shape[-1]
         state_cov_dim = self.Q.shape[-1]
         state_dim = self.G.shape[-2]
@@ -185,7 +246,54 @@ class KalmanFilter:
             for i, v in enumerate(p[0]):
                 print('\t{}: {:.4f}'.format(vnames[i], v[0]))
 
-    def init_param(self, name, P, init):
+        for name in self.unconstrained:
+            P = getattr(self, name)
+            print('\t{}: {}'.format(name, P))
+
+    def translate_shortcut(self, name, P, dims):
+        if P is None:
+            P = self.default_parameters[name]
+
+        if P == 'zeros':
+            return np.zeros(dims)
+        elif P == 'ones':
+            return np.ones(dims)
+        elif P == 'identity':
+            if dims[0] != dims[1]:
+                raise ValueError(
+                    f'[KalmanFilter] translate_shortcut: Attempted to use identity shortcut with unequal dimensions ({dims[0]}x{dims[1]})'
+                )
+            return np.eye(dims[0])
+        elif P == 'diag':
+            if dims[0] != dims[1]:
+                raise ValueError(
+                    f'[KalmanFilter] translate_shortcut: Attempted to use diag shortcut with unequal dimensions ({dims[0]}x{dims[1]})'
+                )
+
+            vname = [f'{name.lower()}.{x}' for x in range(dims[0])]
+            P = np.eye(dims[0], dtype=object)
+            P[np.diag_indices(dims[0])] = vname
+            return P
+        elif P == 'diag_shared':
+            if dims[0] != dims[1]:
+                raise ValueError(
+                    f'[KalmanFilter] translate_shortcut: Attempted to use diag_shared shortcut with unequal dimensions ({dims[0]}x{dims[1]})'
+                )
+
+            P = np.eye(dims[0], dtype=object)
+            P[np.diag_indices(dims[0])] = name.lower()
+            return P
+        elif P == 'unconstrained':
+            P = self.translate_shortcut(name, self.default_parameters[name], dims)
+            self.unconstrained.append(name)
+            return P
+        else:
+            raise ValueError(f'[KalmanFilter] translate_shortcut: Unrecognized shortcut ({P}')
+
+    def init_param(self, name, P, init, dims):
+        if P is None or isinstance(P, str):
+            P = self.translate_shortcut(name, P, dims)
+
         if P.ndim == 2:
             P = P[None]
 
@@ -199,7 +307,7 @@ class KalmanFilter:
             for j in range(P.shape[1]):
                 for k in range(P.shape[2]):
                     v = P[t][j][k]
-                    if type(v) == np.str_:
+                    if isinstance(v, str):
                         p = re.split('[\+\-\*]', v)
                         p = [x.strip() for x in p if x != '']
                         for c in p:
@@ -213,6 +321,7 @@ class KalmanFilter:
         f = np.zeros((P.shape[0], ndim, 1))
         D = np.zeros((P.shape[0], ndim, len(var_list)))
 
+        self.P = P
         for t in range(P.shape[0]):
             for j in range(P.shape[1]):
                 for k in range(P.shape[2]):
@@ -221,7 +330,7 @@ class KalmanFilter:
 
                     if util.is_number_type(v):
                         f[t][c] = float(v)
-                    elif type(v) == np.str_:
+                    elif isinstance(v, str):
                         p = re.split('([\+\-\*])', v)
                         p = [x.strip() for x in p if x != '']
                         sign = 1.0
@@ -258,6 +367,9 @@ class KalmanFilter:
                                     p = p[3:]
                                 else:
                                     raise ValueError('Invalid variable string: {}'.format(v))
+                            elif p[0] == '-':
+                                sign = -1.0
+                                p = p[1:]
                     else:
                         raise ValueError('Unrecognized type in {} ({})'.format(name, type(v)))
 
@@ -710,9 +822,13 @@ class KalmanFilter:
         v = util.safe_inverse(denom.sum(0)) @ num.sum(0)
 
         u = f + D @ v
-        U = u.reshape((D.shape[0], *U.shape[-2:]))
-        if U.shape[0] == 1:
-            U = U[0]
+
+        if 'U' in self.constraints:
+            U = u.reshape((D.shape[0], *U.shape[-2:]))
+            if U.shape[0] == 1:
+                U = U[0]
+        else:
+            U = u.reshape(U.shape[-2:])
 
         return U
 
@@ -777,7 +893,7 @@ class KalmanFilter:
         if z.all():
             if 'x0' in self.constraints:
                 f, D = self.constraints['x0']
-                num, denom = self._em_x0_degenerate(em_params)
+                num, denom = self._em_x0_degenerate(em_params, f, D)
                 p = util.safe_inverse(denom.sum(0)) @ num.sum(0)
                 x0_ = f + D @ p
                 x0_ = x0_.reshape(x0.shape)
@@ -862,9 +978,13 @@ class KalmanFilter:
         A2 = (Dddtt @ Ri @ (e + ya)).sum(0)
 
         u = A1 @ A2
-        A = u.reshape((D.shape[0], *A.shape[-2:]))
-        if A.shape[0] == 1:
-            A = A[0]
+
+        if 'A' in self.constraints:
+            A = u.reshape((D.shape[0], *A.shape[-2:]))
+            if A.shape[0] == 1:
+                A = A[0]
+        else:
+            A = u.reshape(A.shape[-2:])
 
         return A
 
@@ -955,7 +1075,7 @@ class KalmanFilter:
 
     def em(self, n=10, tol=None, eps=1e-2, em_vars=None, **kwargs):
         if em_vars is None:
-            em_vars = list(self.constraints.keys())
+            em_vars = list(self.constraints.keys()) + list(self.unconstrained)
 
         print('Starting EM on: {}'.format(', '.join(em_vars)))
 
