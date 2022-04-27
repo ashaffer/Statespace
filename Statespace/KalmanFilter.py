@@ -243,8 +243,11 @@ class KalmanFilter:
             vnames = self.variable_names[name]
             M = getattr(self, name)
             p = np.linalg.pinv(D) @ (M.flatten()[:,None] - f)
-            for i, v in enumerate(p[0]):
-                print('\t{}: {:.4f}'.format(vnames[i], v[0]))
+            if len(p[0]) < 10:
+                for i, v in enumerate(p[0]):
+                    print('\t{}: {:.4f}'.format(vnames[i], v[0]))
+            else:
+                print('\t{}: {}'.format(name, M))
 
         for name in self.unconstrained:
             P = getattr(self, name)
@@ -282,6 +285,11 @@ class KalmanFilter:
 
             P = np.eye(dims[0], dtype=object)
             P[np.diag_indices(dims[0])] = name.lower()
+            return P
+        elif P == 'lower_triangular':
+            P = np.zeros(dims, dtype=object)
+            tril = np.tril_indices_from(P)
+            P[tril] = [f'{name.lower()}.{x}' for x in range(tril[0].shape[0])]
             return P
         elif P == 'unconstrained':
             P = self.translate_shortcut(name, self.default_parameters[name], dims)
